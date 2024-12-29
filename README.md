@@ -7,7 +7,7 @@ JSerPy is a Python library for serializing and deserializing complex objects to 
 You can install the package directly from GitHub:
 
 ```bash
-pip install git+https://github.com/yourusername/jserpy.git
+pip install git+https://github.com/ronpik/jserpy.git
 ```
 
 ## Usage

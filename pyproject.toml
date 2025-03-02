@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jserpy"
-version = "0.1.2"
+version = "0.1.3"
 authors = [
     {name = "Ron Pick", email = "ronpi1310@gmail.com"},
 ]

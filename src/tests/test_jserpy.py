@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
+from pathlib import Path
 
 from jserpy import serialize_json, deserialize_json, serialize_json_as_dict
 
@@ -24,6 +25,7 @@ class ComplexPerson:
     scores: List[float]
     metadata: Dict[str, str]
     birth_date: datetime
+    path: Path
     optional_field: Optional[str] = None
 
 
@@ -47,7 +49,8 @@ def test_complex_dataclass():
         age=25,
         scores=[95.5, 87.0, 92.5],
         metadata={"city": "New York", "occupation": "Engineer"},
-        birth_date=datetime(1998, 5, 15)
+        birth_date=datetime(1998, 5, 15),
+        path=Path("/tmp/test.txt")
     )
     json_str = serialize_json(person)
     restored = deserialize_json(json.loads(json_str), ComplexPerson)
@@ -68,12 +71,21 @@ def test_enum():
     assert color == restored
 
 
+def test_path():
+    path = Path("/tmp/test.txt")
+    json_str = serialize_json(path)
+    restored = deserialize_json(json.loads(json_str), Path)
+    assert path == restored
+
+
+
 def test_nested_types():
     data = {
         "tuple": (1, "two", 3.0),
         "list": [1, 2, 3],
         "dict": {"a": 1, "b": 2},
-        "enum": Color.BLUE
+        "enum": Color.BLUE,
+        "path": Path("/tmp/test.txt")
     }
     json_str = serialize_json(data)
     restored = deserialize_json(json.loads(json_str), dict)
@@ -81,6 +93,7 @@ def test_nested_types():
     assert restored["list"] == data["list"]
     assert restored["dict"] == data["dict"]
     assert restored["enum"] == data["enum"].value
+    assert restored["path"] == str(data['path'])
 
 
 def test_serialize_as_dict():
@@ -98,6 +111,7 @@ def test_optional_fields():
         scores=[85.0],
         metadata={},
         birth_date=datetime(1984, 3, 12),
+        path=Path("/tmp/test.txt"),
         optional_field="present"
     )
     person2 = ComplexPerson(
@@ -105,7 +119,8 @@ def test_optional_fields():
         age=35,
         scores=[90.0],
         metadata={},
-        birth_date=datetime(1989, 7, 23)
+        birth_date=datetime(1989, 7, 23),
+        path=Path("/tmp/test.txt"),
     )
 
     json_str1 = serialize_json(person1)

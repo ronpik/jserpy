@@ -10,6 +10,7 @@ from typing import Any, TypeVar, Generic, cast, Type, get_origin, get_args, Sequ
 # from typing import Union as UnionType
 import numpy as np
 from enum import Enum
+from pathlib import Path, PurePath
 
 from typing_inspect import is_optional_type, is_generic_type, get_origin
 
@@ -278,6 +279,18 @@ def is_json_primitive(data: JSON) -> bool:
     return is_primitive(data)
 
 
+class PathJsonSerializingHandler(JsonSerializingHandler):
+    @staticmethod
+    def serialize(obj: T) -> JSON:
+        return str(obj)
+
+    @staticmethod
+    def deserialize(data: JSON, cls: type[T]) -> T:
+        from pathlib import Path
+        return Path(data)
+
+
+
 # Register the handlers for each type
 _handlers: dict[type[T], type[JsonSerializingHandler[T]]] = {
     np.ndarray: NumpyJsonSerializingHandler,
@@ -288,6 +301,7 @@ _handlers: dict[type[T], type[JsonSerializingHandler[T]]] = {
     bytes: BytesJsonSerializingHandler,
     datetime.datetime: DatetimeJsonSerializingHandler,
     datetime.date: DatetimeJsonSerializingHandler,
+    Path: PathJsonSerializingHandler,
 }
 
 
@@ -318,6 +332,9 @@ def _get_handler(cls: type[T]) -> typing.Optional[type[JsonSerializingHandler]]:
 
     if issubclass(cls_origin, Jsonable):
         return JsonableSerializingHandler
+
+    if issubclass(cls_origin, PurePath):
+        return PathJsonSerializingHandler
 
     if issubclass(cls_origin, Enum):
         return EnumJsonSerializingHandler

@@ -9,7 +9,6 @@ from functools import lru_cache, partial
 from types import GenericAlias, MappingProxyType, UnionType
 from typing import Any, TypeVar, Generic, cast, Type, get_origin, get_args, Sequence, Union, Tuple
 # from typing import Union as UnionType
-import numpy as np
 from enum import Enum
 from pathlib import Path, PurePath
 
@@ -99,15 +98,18 @@ class JsonSerializingHandler(Generic[T], ABC):
         raise NotImplementedError()
 
 
-class NumpyTypeJsonSerializingHandler(JsonSerializingHandler[np.generic]):
+class NumpyTypeJsonSerializingHandler(JsonSerializingHandler):
+    """NumPy scalars. NumPy is imported lazily (see jserpy._numpy)."""
 
     @staticmethod
-    def serialize(obj: np.generic) -> JSON:
-        return obj.item()
+    def serialize(obj: Any) -> JSON:
+        from jserpy._numpy import serialize_numpy
+        return serialize_numpy(obj, "scalar")
 
     @staticmethod
-    def deserialize(data: JSON, cls: type[np.generic]) -> np.generic:
-        return cls(data)
+    def deserialize(data: JSON, cls: type) -> Any:
+        from jserpy._numpy import deserialize_numpy
+        return deserialize_numpy(data, cls, "scalar")
 
 
 # Handler for Jsonable objects
@@ -280,12 +282,14 @@ class DataclassJsonSerializingHandler(JsonSerializingHandler[DC]):
 class NumpyJsonSerializingHandler(JsonSerializingHandler):
 
     @staticmethod
-    def serialize(obj: T) -> JSON:
-        return obj.tolist()
+    def serialize(obj: Any) -> JSON:
+        from jserpy._numpy import serialize_numpy
+        return serialize_numpy(obj, "array")
 
     @staticmethod
-    def deserialize(data: JSON, cls: type[J]) -> T:
-        return np.array(data)
+    def deserialize(data: JSON, cls: type) -> Any:
+        from jserpy._numpy import deserialize_numpy
+        return deserialize_numpy(data, cls, "array")
 
 
 class BytesJsonSerializingHandler(JsonSerializingHandler):
@@ -347,7 +351,6 @@ class PathJsonSerializingHandler(JsonSerializingHandler):
 
 # Register the handlers for each type
 _handlers: dict[type[T], type[JsonSerializingHandler[T]]] = {
-    np.ndarray: NumpyJsonSerializingHandler,
     tuple: TupleJsonSerializingHandler,
     list: ListJsonSerializingHandler,
     UnionType: UnionJsonSerializingHandler,
@@ -406,7 +409,12 @@ def _get_handler(cls: type[T]) -> typing.Optional[type[JsonSerializingHandler]]:
     if issubclass(cls_origin, tuple):
         return TupleJsonSerializingHandler
 
-    if issubclass(cls_origin, np.generic):
+    from jserpy._numpy import get_numpy_kind
+
+    numpy_kind = get_numpy_kind(cls_origin)
+    if numpy_kind == "array":
+        return NumpyJsonSerializingHandler
+    if numpy_kind == "scalar":
         return NumpyTypeJsonSerializingHandler
 
 

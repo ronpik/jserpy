@@ -1,7 +1,10 @@
 import json
 
 import pytest
-import numpy as np
+try:
+    import numpy as np
+except ModuleNotFoundError:  # numpy is an optional dependency
+    np = None
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Dict, Tuple, Optional
@@ -57,6 +60,7 @@ def test_complex_dataclass():
     assert person == restored
 
 
+@pytest.mark.skipif(np is None, reason="numpy not installed")
 def test_numpy_array():
     arr = np.array([1, 2, 3, 4, 5])
     json_str = serialize_json(arr)

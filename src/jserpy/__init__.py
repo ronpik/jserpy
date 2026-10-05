@@ -1,1 +1,13 @@
-from jserpy.json_handler import serialize_json, deserialize_json, serialize_json_as_dict
+from jserpy.json_handler import (
+    deserialize_json,
+    serialize_json,
+    serialize_json_as_dict,
+    serialize_json_as_obj,
+)
+
+__all__ = [
+    "deserialize_json",
+    "serialize_json",
+    "serialize_json_as_dict",
+    "serialize_json_as_obj",
+]

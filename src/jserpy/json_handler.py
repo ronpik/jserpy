@@ -3,8 +3,10 @@ import datetime
 import json
 import typing
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
+from decimal import Decimal
 from functools import lru_cache, partial
 from types import GenericAlias, MappingProxyType, UnionType
 from typing import Any, TypeVar, Generic, cast, Type, get_origin, get_args, Sequence, Union, Tuple
@@ -23,6 +25,142 @@ T = TypeVar('T')
 J = TypeVar('J', bound=Union[Jsonable, Dataclass])
 JJ = TypeVar('JJ', bound=Jsonable)
 DC = TypeVar('DC', bound=dataclass)
+Fallback = Callable[[Any], Any]
+
+
+def _type_name(value: Any) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
+class _SerializationContext:
+    """State of a single serialization call.
+
+    `prepare` normalizes containers (mapping keys, tuples, sets, ...) before they reach `json.dumps`, and tracks
+    the containers currently being converted so that cycles fail predictably. Error messages never include the
+    serialized values, only type names.
+    """
+
+    def __init__(self, *, fallback: Fallback | None, allow_nan: bool):
+        self.fallback = fallback
+        self.allow_nan = allow_nan
+        self._active_ids: set[int] = set()
+
+    @contextmanager
+    def tracking(self, value: Any):
+        value_id = id(value)
+        if value_id in self._active_ids:
+            raise ValueError("Cyclic reference detected during JSON serialization")
+
+        self._active_ids.add(value_id)
+        try:
+            yield
+        finally:
+            self._active_ids.remove(value_id)
+
+    def prepare(self, value: Any) -> Any:
+        if id(value) in self._active_ids:
+            raise ValueError("Cyclic reference detected during JSON serialization")
+
+        if isinstance(value, (Mapping, list, tuple)):
+            handler = _get_handler(type(value))
+            native_container_handlers = {
+                ListJsonSerializingHandler,
+                TupleJsonSerializingHandler,
+            }
+            if handler is not None and handler not in native_container_handlers:
+                return self.prepare_with_handler(value, handler)
+
+        if isinstance(value, Mapping):
+            with self.tracking(value):
+                return self._prepare_mapping(value)
+
+        if isinstance(value, list):
+            with self.tracking(value):
+                return [self.prepare(item) for item in value]
+
+        if isinstance(value, tuple):
+            with self.tracking(value):
+                return tuple(self.prepare(item) for item in value)
+
+        return value
+
+    def _prepare_mapping(self, value: Mapping[Any, Any]) -> dict[str, Any]:
+        prepared: dict[str, Any] = {}
+        for key, item in value.items():
+            converted_key = self.convert_key(key)
+            if converted_key in prepared:
+                raise ValueError("JSON mapping key collision detected")
+            prepared[converted_key] = self.prepare(item)
+        return prepared
+
+    def convert_key(self, key: Any) -> str:
+        if isinstance(key, Enum):
+            enum_value = EnumJsonSerializingHandler.serialize(key)
+            if enum_value is None:
+                return "null"
+            return self.convert_key(enum_value)
+
+        if isinstance(key, tuple):
+            return _encode_json(
+                key,
+                context=self,
+                ensure_ascii=True,
+                allow_nan=self.allow_nan,
+                indent=None,
+                separators=None,
+                sort_keys=False,
+            )
+
+        if isinstance(key, str):
+            return str.__str__(key)
+
+        if isinstance(key, bool):
+            return "true" if key else "false"
+
+        if isinstance(key, int):
+            return int.__repr__(key)
+
+        if isinstance(key, float):
+            return json.dumps(key, allow_nan=self.allow_nan)
+
+        raise TypeError(f"Unsupported JSON mapping key type: {_type_name(key)}")
+
+    def prepare_set(self, value: set[Any] | frozenset[Any]) -> list[JSON]:
+        # Sets have no order: sort the items by their canonical (compact, sorted-keys) JSON text, not by repr().
+        normalized_items: list[tuple[str, JSON]] = []
+        with self.tracking(value):
+            for item in value:
+                canonical = _encode_json(
+                    item,
+                    context=self,
+                    ensure_ascii=True,
+                    allow_nan=self.allow_nan,
+                    indent=None,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                normalized_items.append((canonical, cast(JSON, json.loads(canonical))))
+
+        normalized_items.sort(key=lambda item: item[0])
+        return [item for _, item in normalized_items]
+
+    def prepare_with_handler(
+        self,
+        value: Any,
+        handler: type["JsonSerializingHandler[Any]"],
+    ) -> Any:
+        if handler is SetJsonSerializingHandler:
+            return self.prepare_set(value)
+
+        with self.tracking(value):
+            serialized = handler.serialize(value)
+            if serialized is value:
+                raise ValueError(
+                    "Cyclic reference returned by registered JSON handler for "
+                    f"{_type_name(value)}"
+                )
+            return self.prepare(serialized)
 
 
 def convert_tuple_key(t: tuple) -> str:
@@ -34,19 +172,6 @@ def _restore_tuple_key(key: str, cls: Union[Type[Tuple], GenericAlias]) -> tuple
     deserialized_obj = json.loads(key)
     deserialized_key = deserialize_json(deserialized_obj, cls)
     return deserialized_key
-
-
-def _convert_key(key: Any) -> str:
-    if isinstance(key, Enum):
-        return EnumJsonSerializingHandler.serialize(key)
-
-    if isinstance(key, tuple):
-        return convert_tuple_key(key)
-
-    if not isinstance(key, (str, int, float, bool)):
-        raise ValueError(f"Couldn't convert key of the given type to str: {type(key)} ({key=})")
-
-    return key
 
 
 def _reconstruct_key(key: str, cls: Type[T]) -> T:
@@ -61,18 +186,9 @@ def _reconstruct_key(key: str, cls: Type[T]) -> T:
         return _restore_tuple_key(key, cls)
 
     if not issubclass(cls_origin, str):
-        raise ValueError(f"Couldn't de-convert key to its original type: '{key}' -> {cls}")
+        raise ValueError(f"Couldn't de-convert JSON mapping key to its original type: {cls}")
 
     return key
-
-
-def _serialize_keys(obj: Any) -> Any:
-    if isinstance(obj, list):
-        return [_serialize_keys(item) for item in obj]
-    if not isinstance(obj, dict):
-        return obj
-
-    return {_convert_key(k): _serialize_keys(v) for k, v in obj.items()}
 
 
 def _deserialize_keys(obj: Any, keys_cls: Type[T]) -> Any:
@@ -184,12 +300,31 @@ class GenericJsonSerializingHandler(JsonSerializingHandler[GenericAlias]):
         pass
 
 
+class SetJsonSerializingHandler(JsonSerializingHandler[set[Any] | frozenset[Any]]):
+    """set / frozenset: serialized as a JSON array in a deterministic order (see `_SerializationContext.prepare_set`)."""
+
+    @staticmethod
+    def serialize(obj: set[Any] | frozenset[Any]) -> JSON:
+        return list(obj)
+
+    @staticmethod
+    def deserialize(data: JSON, cls: type[set[Any] | frozenset[Any]]) -> set[Any] | frozenset[Any]:
+        cls_origin = get_origin(cls) or cls
+        generic_args = get_args(cls)
+        values = data
+        if generic_args:
+            item_type = generic_args[0]
+            values = [deserialize_json(item, item_type) for item in data]
+        return cls_origin(values)
+
+
 class MappingJsonSerializingHandler(JsonSerializingHandler):
     """Handles MappingProxyType (and Mapping annotations): serialized as a plain JSON object."""
 
     @staticmethod
     def serialize(obj: Mapping) -> JSON:
-        return _serialize_keys(dict(obj))
+        # Keys and nested values are converted by `_SerializationContext.prepare`.
+        return cast(JSON, dict(obj))
 
     @staticmethod
     def deserialize(data: JSON, cls: type[Mapping]) -> Mapping:
@@ -249,9 +384,8 @@ class DataclassJsonSerializingHandler(JsonSerializingHandler[DC]):
     @staticmethod
     def serialize(obj: DC) -> JSON:
         # Not dataclasses.asdict: it deep-copies values and fails on non-copyable ones (e.g. MappingProxyType).
-        # Nested values are converted by the encoder.
-        data_dict = {field.name: getattr(obj, field.name) for field in fields(obj)}
-        return _serialize_keys(data_dict)
+        # Nested values are converted by `_SerializationContext.prepare` and the encoder.
+        return cast(JSON, {field.name: getattr(obj, field.name) for field in fields(obj)})
 
     @staticmethod
     def deserialize(data: JSON, cls: type[DC]) -> DC:
@@ -307,7 +441,7 @@ class BytesJsonSerializingHandler(JsonSerializingHandler):
 
 
 class DatetimeJsonSerializingHandler(JsonSerializingHandler):
-    """Convert datetime (or date) object to ISO 8601 string and back to datetime (or date) object."""
+    """Convert datetime (or date, time) object to ISO 8601 string and back to datetime (or date, time) object."""
 
     @staticmethod
     def serialize(obj: datetime.datetime) -> JSON:
@@ -316,6 +450,18 @@ class DatetimeJsonSerializingHandler(JsonSerializingHandler):
     @staticmethod
     def deserialize(data: JSON, cls: type[datetime.datetime]) -> T:
         return cls.fromisoformat(data)
+
+
+class DecimalJsonSerializingHandler(JsonSerializingHandler[Decimal]):
+    """Decimal <-> string, so that precision and trailing zeroes survive."""
+
+    @staticmethod
+    def serialize(obj: Decimal) -> JSON:
+        return str(obj)
+
+    @staticmethod
+    def deserialize(data: JSON, cls: type[Decimal]) -> Decimal:
+        return cls(data)
 
 
 # Handler for Enum objects
@@ -353,11 +499,15 @@ class PathJsonSerializingHandler(JsonSerializingHandler):
 _handlers: dict[type[T], type[JsonSerializingHandler[T]]] = {
     tuple: TupleJsonSerializingHandler,
     list: ListJsonSerializingHandler,
+    set: SetJsonSerializingHandler,
+    frozenset: SetJsonSerializingHandler,
     UnionType: UnionJsonSerializingHandler,
     typing.Union: UnionJsonSerializingHandler,
     bytes: BytesJsonSerializingHandler,
     datetime.datetime: DatetimeJsonSerializingHandler,
     datetime.date: DatetimeJsonSerializingHandler,
+    datetime.time: DatetimeJsonSerializingHandler,
+    Decimal: DecimalJsonSerializingHandler,
     Path: PathJsonSerializingHandler,
     MappingProxyType: MappingJsonSerializingHandler,
     Mapping: MappingJsonSerializingHandler,
@@ -409,6 +559,9 @@ def _get_handler(cls: type[T]) -> typing.Optional[type[JsonSerializingHandler]]:
     if issubclass(cls_origin, tuple):
         return TupleJsonSerializingHandler
 
+    if issubclass(cls_origin, (set, frozenset)):
+        return SetJsonSerializingHandler
+
     from jserpy._numpy import get_numpy_kind
 
     numpy_kind = get_numpy_kind(cls_origin)
@@ -417,25 +570,105 @@ def _get_handler(cls: type[T]) -> typing.Optional[type[JsonSerializingHandler]]:
     if numpy_kind == "scalar":
         return NumpyTypeJsonSerializingHandler
 
+    return None
+
 
 class CustomEncoder(json.JSONEncoder):
 
+    def __init__(self, *args: Any, _jserpy_context: _SerializationContext | None = None, **kwargs: Any):
+        self._jserpy_context = _jserpy_context or _SerializationContext(
+            fallback=None,
+            allow_nan=kwargs.get("allow_nan", True),
+        )
+        super().__init__(*args, **kwargs)
+
     def default(self, obj: Any):
+        # Precedence: a registered handler first, the caller's fallback only for values no handler supports.
         handler = _get_handler(type(obj))
         if handler is not None:
-            return handler.serialize(obj)
+            return self._jserpy_context.prepare_with_handler(obj, handler)
+
+        fallback = self._jserpy_context.fallback
+        if fallback is not None:
+            with self._jserpy_context.tracking(obj):
+                converted = fallback(obj)
+                if converted is obj:
+                    raise ValueError(
+                        f"Fallback returned the original unsupported value for {_type_name(obj)}"
+                    )
+                # The result may itself contain supported (or unsupported) values: process it recursively.
+                return self._jserpy_context.prepare(converted)
 
         return super().default(obj)
 
 
-def serialize_json(obj: Any) -> str:
-    converted_obj = _serialize_keys(obj)
-    return json.dumps(converted_obj, cls=CustomEncoder)
+def _encode_json(
+    obj: Any,
+    *,
+    context: _SerializationContext,
+    ensure_ascii: bool,
+    allow_nan: bool,
+    indent: int | str | None,
+    separators: tuple[str, str] | None,
+    sort_keys: bool,
+) -> str:
+    prepared = context.prepare(obj)
+    try:
+        return json.dumps(
+            prepared,
+            cls=CustomEncoder,
+            ensure_ascii=ensure_ascii,
+            allow_nan=allow_nan,
+            indent=indent,
+            separators=separators,
+            sort_keys=sort_keys,
+            _jserpy_context=context,
+        )
+    except ValueError as error:
+        if str(error) == "Circular reference detected":
+            raise ValueError("Cyclic reference detected during JSON serialization") from error
+        raise
 
 
-def serialize_json_as_dict(obj: Any) -> dict[str, JSON]:
-    serialized = serialize_json(obj)
-    return json.loads(serialized)
+def serialize_json(
+    obj: Any,
+    *,
+    ensure_ascii: bool = True,
+    allow_nan: bool = True,
+    indent: int | str | None = None,
+    separators: tuple[str, str] | None = None,
+    sort_keys: bool = False,
+    fallback: Fallback | None = None,
+) -> str:
+    """Serialize `obj` to a JSON string.
+
+    The keyword-only arguments are forwarded to `json.dumps`. `fallback` is called for a value that no registered
+    handler supports; its result is serialized recursively. With no extra arguments the output is identical to
+    previous versions.
+    """
+    context = _SerializationContext(fallback=fallback, allow_nan=allow_nan)
+    return _encode_json(
+        obj,
+        context=context,
+        ensure_ascii=ensure_ascii,
+        allow_nan=allow_nan,
+        indent=indent,
+        separators=separators,
+        sort_keys=sort_keys,
+    )
+
+
+def serialize_json_as_obj(obj: Any, *, fallback: Fallback | None = None) -> "JSON":
+    """Convert `obj` to a detached, JSON-compatible tree (dicts, lists, str, int, float, bool, None).
+
+    Equal to `json.loads(serialize_json(obj, fallback=fallback))`, for any JSON root.
+    """
+    return cast(JSON, json.loads(serialize_json(obj, fallback=fallback)))
+
+
+def serialize_json_as_dict(obj: Any, *, fallback: Fallback | None = None) -> "JSON":
+    """Backward-compatible alias of `serialize_json_as_obj` (the root is not necessarily a dict)."""
+    return serialize_json_as_obj(obj, fallback=fallback)
 
 
 def deserialize_json(data: JSON, cls: type[T]) -> T:

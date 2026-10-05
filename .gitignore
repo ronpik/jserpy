@@ -39,3 +39,6 @@ htmlcov/
 # Distribution
 dist/
 build/
+
+# docs
+/docs

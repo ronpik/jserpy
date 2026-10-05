@@ -1,0 +1,107 @@
+name: Python tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python-version }} (${{ matrix.install }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        install: [base, numpy]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install base package and test runner
+        if: matrix.install == 'base'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          python -m pip install .
+
+      - name: Verify base installation has no NumPy
+        if: matrix.install == 'base'
+        run: |
+          python - <<'PY'
+          import importlib.util
+
+          assert importlib.util.find_spec("numpy") is None
+          import jserpy
+          PY
+
+      - name: Install NumPy extra and test runner
+        if: matrix.install == 'numpy'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest ".[numpy]"
+
+      - name: Verify NumPy integration imports
+        if: matrix.install == 'numpy'
+        run: python -c "import jserpy, numpy"
+
+      - name: Run tests
+        run: python -m pytest src/tests
+
+  build-and-install:
+    name: Build and clean-install distributions
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel and source distribution
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+          python -m build
+
+      - name: Smoke-test wheel without NumPy
+        run: |
+          wheel_path="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          test -n "$wheel_path"
+          python -m venv /tmp/jserpy-base
+          /tmp/jserpy-base/bin/python -m pip install "$wheel_path"
+          /tmp/jserpy-base/bin/python - <<'PY'
+          import importlib.util
+
+          assert importlib.util.find_spec("numpy") is None
+          import jserpy
+          PY
+
+      - name: Smoke-test wheel with NumPy extra
+        run: |
+          wheel_path="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          test -n "$wheel_path"
+          python -m venv /tmp/jserpy-numpy
+          /tmp/jserpy-numpy/bin/python -m pip install \
+            "jserpy[numpy] @ file://${GITHUB_WORKSPACE}/${wheel_path}"
+          /tmp/jserpy-numpy/bin/python -c "import jserpy, numpy"
+
+      - name: Smoke-test source distribution
+        run: |
+          sdist_path="$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          test -n "$sdist_path"
+          python -m venv /tmp/jserpy-sdist
+          /tmp/jserpy-sdist/bin/python -m pip install "$sdist_path"
+          /tmp/jserpy-sdist/bin/python - <<'PY'
+          import importlib.util
+
+          assert importlib.util.find_spec("numpy") is None
+          import jserpy
+          PY

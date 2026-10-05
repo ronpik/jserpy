@@ -3,12 +3,12 @@ import datetime
 import json
 import typing
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, asdict, fields, is_dataclass
-from functools import partial
-from types import GenericAlias, UnionType
+from collections.abc import Mapping
+from dataclasses import dataclass, fields, is_dataclass
+from functools import lru_cache, partial
+from types import GenericAlias, MappingProxyType, UnionType
 from typing import Any, TypeVar, Generic, cast, Type, get_origin, get_args, Sequence, Union, Tuple
 # from typing import Union as UnionType
-import numpy as np
 from enum import Enum
 from pathlib import Path, PurePath
 
@@ -98,15 +98,18 @@ class JsonSerializingHandler(Generic[T], ABC):
         raise NotImplementedError()
 
 
-class NumpyTypeJsonSerializingHandler(JsonSerializingHandler[np.generic]):
+class NumpyTypeJsonSerializingHandler(JsonSerializingHandler):
+    """NumPy scalars. NumPy is imported lazily (see jserpy._numpy)."""
 
     @staticmethod
-    def serialize(obj: np.generic) -> JSON:
-        return obj.item()
+    def serialize(obj: Any) -> JSON:
+        from jserpy._numpy import serialize_numpy
+        return serialize_numpy(obj, "scalar")
 
     @staticmethod
-    def deserialize(data: JSON, cls: type[np.generic]) -> np.generic:
-        return cls(data)
+    def deserialize(data: JSON, cls: type) -> Any:
+        from jserpy._numpy import deserialize_numpy
+        return deserialize_numpy(data, cls, "scalar")
 
 
 # Handler for Jsonable objects
@@ -132,11 +135,13 @@ class TupleJsonSerializingHandler(JsonSerializingHandler[tuple]):
         # if not isinstance(cls, GenericAlias):
         #     return tuple(data)
 
-        if not is_generic_type(cls):
+        generic_args_types = get_args(cls)
+        if not generic_args_types:
             return tuple(data)
 
-        cls_generic = cast(GenericAlias, cls)
-        generic_args_types = get_args(cls_generic)
+        if len(generic_args_types) == 2 and generic_args_types[1] is Ellipsis:
+            _deserialize = partial(deserialize_json, cls=generic_args_types[0])
+            return tuple(map(_deserialize, data))
 
         if len(data) == len(generic_args_types):
             tuple_data = (deserialize_json(item, arg_cls) for item, arg_cls in zip(data, generic_args_types))
@@ -179,6 +184,44 @@ class GenericJsonSerializingHandler(JsonSerializingHandler[GenericAlias]):
         pass
 
 
+class MappingJsonSerializingHandler(JsonSerializingHandler):
+    """Handles MappingProxyType (and Mapping annotations): serialized as a plain JSON object."""
+
+    @staticmethod
+    def serialize(obj: Mapping) -> JSON:
+        return _serialize_keys(dict(obj))
+
+    @staticmethod
+    def deserialize(data: JSON, cls: type[Mapping]) -> Mapping:
+        if not isinstance(data, dict):
+            raise TypeError(f"Expected a JSON object for {cls}, got {type(data).__name__}")
+        cls_origin = get_origin(cls) or cls
+        generic_args = get_args(cls)
+        if generic_args:
+            key_cls, value_cls = generic_args
+            if key_cls is not Any:
+                data = _deserialize_keys(data, key_cls)
+            data = {k: deserialize_json(v, value_cls) for k, v in data.items()}
+        if issubclass(cls_origin, MappingProxyType):
+            return MappingProxyType(dict(data))
+        return dict(data)
+
+
+class LiteralJsonSerializingHandler(JsonSerializingHandler):
+
+    @staticmethod
+    def serialize(obj: Any) -> JSON:
+        return obj
+
+    @staticmethod
+    def deserialize(data: JSON, cls: Any) -> Any:
+        allowed = get_args(cls)
+        # compare type too, so that e.g. 1 / True do not match each other
+        if any(type(data) is type(value) and data == value for value in allowed):
+            return data
+        raise TypeError(f"Value {data!r} is not one of the allowed literals {allowed}")
+
+
 class UnionJsonSerializingHandler(JsonSerializingHandler):
 
     @staticmethod
@@ -191,22 +234,35 @@ class UnionJsonSerializingHandler(JsonSerializingHandler):
         return deserialize_multi_cls_from_json(data, cls_list)
 
 
+@lru_cache(maxsize=None)
+def _resolved_field_types(cls: type) -> dict[str, Any]:
+    """Resolve string annotations (e.g. `from __future__ import annotations`) once per class."""
+    try:
+        return typing.get_type_hints(cls)
+    except Exception:
+        return {}
+
+
 # Handler for dataclasses with recursive deserialization
 class DataclassJsonSerializingHandler(JsonSerializingHandler[DC]):
 
     @staticmethod
     def serialize(obj: DC) -> JSON:
-        data_dict = asdict(obj)
-        converted_data_dict = _serialize_keys(data_dict)
-        return converted_data_dict
+        # Not dataclasses.asdict: it deep-copies values and fails on non-copyable ones (e.g. MappingProxyType).
+        # Nested values are converted by the encoder.
+        data_dict = {field.name: getattr(obj, field.name) for field in fields(obj)}
+        return _serialize_keys(data_dict)
 
     @staticmethod
     def deserialize(data: JSON, cls: type[DC]) -> DC:
         kwargs = {}
+        resolved_types = _resolved_field_types(cls)
         # Iterate through each field of the dataclass
         for field in fields(cls):
             field_name = field.name
             field_type = field.type
+            if isinstance(field_type, str):
+                field_type = resolved_types.get(field_name, field_type)
             try:
                 field_value = data[field_name]
             except KeyError as e:
@@ -226,12 +282,14 @@ class DataclassJsonSerializingHandler(JsonSerializingHandler[DC]):
 class NumpyJsonSerializingHandler(JsonSerializingHandler):
 
     @staticmethod
-    def serialize(obj: T) -> JSON:
-        return obj.tolist()
+    def serialize(obj: Any) -> JSON:
+        from jserpy._numpy import serialize_numpy
+        return serialize_numpy(obj, "array")
 
     @staticmethod
-    def deserialize(data: JSON, cls: type[J]) -> T:
-        return np.array(data)
+    def deserialize(data: JSON, cls: type) -> Any:
+        from jserpy._numpy import deserialize_numpy
+        return deserialize_numpy(data, cls, "array")
 
 
 class BytesJsonSerializingHandler(JsonSerializingHandler):
@@ -293,7 +351,6 @@ class PathJsonSerializingHandler(JsonSerializingHandler):
 
 # Register the handlers for each type
 _handlers: dict[type[T], type[JsonSerializingHandler[T]]] = {
-    np.ndarray: NumpyJsonSerializingHandler,
     tuple: TupleJsonSerializingHandler,
     list: ListJsonSerializingHandler,
     UnionType: UnionJsonSerializingHandler,
@@ -302,6 +359,9 @@ _handlers: dict[type[T], type[JsonSerializingHandler[T]]] = {
     datetime.datetime: DatetimeJsonSerializingHandler,
     datetime.date: DatetimeJsonSerializingHandler,
     Path: PathJsonSerializingHandler,
+    MappingProxyType: MappingJsonSerializingHandler,
+    Mapping: MappingJsonSerializingHandler,
+    typing.Literal: LiteralJsonSerializingHandler,
 }
 
 
@@ -319,7 +379,8 @@ def is_valid_class(cls: Type[T]) -> bool:
 
 
 def _get_handler(cls: type[T]) -> typing.Optional[type[JsonSerializingHandler]]:
-    cls_origin = cast(type, get_origin(cls))
+    # typing.get_origin (unlike typing_inspect's) recognizes `X | Y` unions, incl. ones containing generics
+    cls_origin = cast(type, typing.get_origin(cls))
     if cls_origin is None:
         cls_origin = cls
 
@@ -348,7 +409,12 @@ def _get_handler(cls: type[T]) -> typing.Optional[type[JsonSerializingHandler]]:
     if issubclass(cls_origin, tuple):
         return TupleJsonSerializingHandler
 
-    if issubclass(cls_origin, np.generic):
+    from jserpy._numpy import get_numpy_kind
+
+    numpy_kind = get_numpy_kind(cls_origin)
+    if numpy_kind == "array":
+        return NumpyJsonSerializingHandler
+    if numpy_kind == "scalar":
         return NumpyTypeJsonSerializingHandler
 
 
@@ -373,6 +439,18 @@ def serialize_json_as_dict(obj: Any) -> dict[str, JSON]:
 
 
 def deserialize_json(data: JSON, cls: type[T]) -> T:
+    if cls is Any:
+        return data
+
+    if cls is float and type(data) is int:
+        # JSON from non-Python encoders may write whole floats as ints
+        return float(data)
+
+    if cls is type(None):
+        if data is not None:
+            raise TypeError(f"Expected null, got {type(data).__name__}")
+        return None
+
     handler = _get_handler(cls)
     if handler is not None:
         return handler.deserialize(data, cls)

@@ -442,6 +442,10 @@ def deserialize_json(data: JSON, cls: type[T]) -> T:
     if cls is Any:
         return data
 
+    if cls is float and type(data) is int:
+        # JSON from non-Python encoders may write whole floats as ints
+        return float(data)
+
     if cls is type(None):
         if data is not None:
             raise TypeError(f"Expected null, got {type(data).__name__}")

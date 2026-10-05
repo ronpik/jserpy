@@ -28,3 +28,7 @@ numpy = [
 [project.urls]
 "Homepage" = "https://github.com/ronpik/jserpy"
 "Bug Tracker" = "https://github.com/ronpik/jserpy/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["jserpy*"]

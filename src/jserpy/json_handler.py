@@ -33,6 +33,38 @@ def _type_name(value: Any) -> str:
     return f"{value_type.__module__}.{value_type.__qualname__}"
 
 
+_NESTED_TOO_DEEPLY = "JSON structure is nested too deeply to serialize"
+# Bound of the explicit stack of `_SerializationContext.prepare`, for values that never stop nesting (e.g. a handler
+# that returns a new container of its own type). Well above what the stdlib encoder handles: about 10_000 levels up to
+# 3.13 and about 100_000 on 3.14 (8 MiB stack).
+_MAX_PREPARE_DEPTH = 200_000
+
+# Kinds of `_Frame`; `_PENDING` stands for a prepared value that is not ready yet (see `_SerializationContext.prepare`)
+_MAPPING_FRAME = 0
+_LIST_FRAME = 1
+_TUPLE_FRAME = 2
+_HANDLER_FRAME = 3
+_PENDING = object()
+
+
+class _Frame:
+    """An entry of the explicit stack of `_SerializationContext.prepare`.
+
+    A container frame holds the iterator over the source container and the prepared items so far (`key` is the
+    converted key of the mapping item in progress). A handler frame keeps a value tracked while the result of its
+    registered handler is prepared.
+    """
+
+    __slots__ = ("kind", "source", "items", "prepared", "key")
+
+    def __init__(self, kind: int, source: Any, prepared: Any = None):
+        self.kind = kind
+        self.source = source
+        self.items: Any = None
+        self.prepared = prepared
+        self.key: str | None = None
+
+
 class _SerializationContext:
     """State of a single serialization call.
 
@@ -59,40 +91,91 @@ class _SerializationContext:
             self._active_ids.remove(value_id)
 
     def prepare(self, value: Any) -> Any:
-        if id(value) in self._active_ids:
-            raise ValueError("Cyclic reference detected during JSON serialization")
+        # A depth-first walk with an explicit stack instead of recursion, so that the nesting depth is limited only by
+        # the stdlib encoder, not by Python frames. Values are visited, tracked and checked in the same order as by a
+        # recursive walk.
+        stack: list[_Frame] = []
+        try:
+            result = self._enter(value, stack)
+            while stack:
+                frame = stack[-1]
+                if result is not _PENDING:
+                    # `result` is the prepared form of what the top frame waits for
+                    if frame.kind == _HANDLER_FRAME:
+                        stack.pop()
+                        self._active_ids.remove(id(frame.source))
+                        continue
+                    if frame.kind == _MAPPING_FRAME:
+                        frame.prepared[frame.key] = result
+                    else:
+                        frame.prepared.append(result)
+                result = self._fill(frame, stack)
+        except BaseException:
+            for frame in stack:
+                self._active_ids.discard(id(frame.source))
+            raise
+        return result
 
-        if isinstance(value, (Mapping, list, tuple)):
+    def _enter(self, value: Any, stack: list[_Frame]) -> Any:
+        """Return the prepared form of `value`, or `_PENDING` after pushing a frame for a container to fill."""
+        while True:
+            if id(value) in self._active_ids:
+                raise ValueError("Cyclic reference detected during JSON serialization")
+
+            if not isinstance(value, (Mapping, list, tuple)):
+                return value
+
+            if len(stack) >= _MAX_PREPARE_DEPTH:
+                raise ValueError(_NESTED_TOO_DEEPLY)
+
             handler = _get_handler(type(value))
-            native_container_handlers = {
-                ListJsonSerializingHandler,
-                TupleJsonSerializingHandler,
-            }
-            if handler is not None and handler not in native_container_handlers:
-                return self.prepare_with_handler(value, handler)
+            if handler is not None and handler not in (ListJsonSerializingHandler, TupleJsonSerializingHandler):
+                if handler is SetJsonSerializingHandler:
+                    return self.prepare_set(value)
+                # As in `prepare_with_handler`: `value` stays tracked until its serialized form is prepared
+                stack.append(_Frame(_HANDLER_FRAME, value))
+                self._active_ids.add(id(value))
+                value = self._serialize_with_handler(value, handler)
+                continue
 
-        if isinstance(value, Mapping):
-            with self.tracking(value):
-                return self._prepare_mapping(value)
+            if isinstance(value, Mapping):
+                frame = _Frame(_MAPPING_FRAME, value, {})
+            elif isinstance(value, list):
+                frame = _Frame(_LIST_FRAME, value, [])
+            else:
+                frame = _Frame(_TUPLE_FRAME, value, [])
+            stack.append(frame)
+            self._active_ids.add(id(value))
+            frame.items = iter(value.items() if frame.kind == _MAPPING_FRAME else value)
+            return _PENDING
 
-        if isinstance(value, list):
-            with self.tracking(value):
-                return [self.prepare(item) for item in value]
+    def _fill(self, frame: _Frame, stack: list[_Frame]) -> Any:
+        """Prepare the remaining items of the container `frame`, the top of `stack`.
 
-        if isinstance(value, tuple):
-            with self.tracking(value):
-                return tuple(self.prepare(item) for item in value)
+        Return the prepared container once all items are done, or the result of `_enter` for an item that pushed
+        frames of its own (the item is stored when that result is ready).
+        """
+        prepared = frame.prepared
+        if frame.kind == _MAPPING_FRAME:
+            for key, item in frame.items:
+                converted_key = self.convert_key(key)
+                if converted_key in prepared:
+                    raise ValueError("JSON mapping key collision detected")
+                result = self._enter(item, stack)
+                if stack[-1] is not frame:
+                    frame.key = converted_key
+                    return result
+                prepared[converted_key] = result
+        else:
+            for item in frame.items:
+                result = self._enter(item, stack)
+                if stack[-1] is not frame:
+                    return result
+                prepared.append(result)
 
-        return value
-
-    def _prepare_mapping(self, value: Mapping[Any, Any]) -> dict[str, Any]:
-        prepared: dict[str, Any] = {}
-        for key, item in value.items():
-            converted_key = self.convert_key(key)
-            if converted_key in prepared:
-                raise ValueError("JSON mapping key collision detected")
-            prepared[converted_key] = self.prepare(item)
-        return prepared
+        stack.pop()
+        self._active_ids.remove(id(frame.source))
+        return tuple(prepared) if frame.kind == _TUPLE_FRAME else prepared
 
     def convert_key(self, key: Any) -> str:
         if isinstance(key, Enum):
@@ -154,13 +237,17 @@ class _SerializationContext:
             return self.prepare_set(value)
 
         with self.tracking(value):
-            serialized = handler.serialize(value)
-            if serialized is value:
-                raise ValueError(
-                    "Cyclic reference returned by registered JSON handler for "
-                    f"{_type_name(value)}"
-                )
-            return self.prepare(serialized)
+            return self.prepare(self._serialize_with_handler(value, handler))
+
+    @staticmethod
+    def _serialize_with_handler(value: Any, handler: type["JsonSerializingHandler[Any]"]) -> Any:
+        serialized = handler.serialize(value)
+        if serialized is value:
+            raise ValueError(
+                "Cyclic reference returned by registered JSON handler for "
+                f"{_type_name(value)}"
+            )
+        return serialized
 
 
 def convert_tuple_key(t: tuple) -> str:
@@ -707,25 +794,40 @@ def serialize_json(
     The keyword-only arguments are forwarded to `json.dumps`. `fallback` is called for a value that no registered
     handler supports; its result is serialized recursively. With no extra arguments the output is identical to
     previous versions.
+
+    Raises ValueError for a cyclic reference, and for a structure nested more deeply than the `json` module can encode
+    (including a handler or fallback that recurses without bound).
     """
     context = _SerializationContext(fallback=fallback, allow_nan=allow_nan)
-    return _encode_json(
-        obj,
-        context=context,
-        ensure_ascii=ensure_ascii,
-        allow_nan=allow_nan,
-        indent=indent,
-        separators=separators,
-        sort_keys=sort_keys,
-    )
+    try:
+        return _encode_json(
+            obj,
+            context=context,
+            ensure_ascii=ensure_ascii,
+            allow_nan=allow_nan,
+            indent=indent,
+            separators=separators,
+            sort_keys=sort_keys,
+        )
+    except RecursionError as error:
+        # jserpy's own walk is iterative, but the stdlib encoder still recurses (in C, through `CustomEncoder.default`
+        # for handler-converted values, and in Python with `indent` before 3.13), as do the encoding of nested sets
+        # and user handlers or fallbacks. Report one documented error instead of a RecursionError that depends on the
+        # caller's stack depth.
+        raise ValueError(_NESTED_TOO_DEEPLY) from error
 
 
 def serialize_json_as_obj(obj: Any, *, fallback: Fallback | None = None) -> "JSON":
     """Convert `obj` to a detached, JSON-compatible tree (dicts, lists, str, int, float, bool, None).
 
-    Equal to `json.loads(serialize_json(obj, fallback=fallback))`, for any JSON root.
+    Equal to `json.loads(serialize_json(obj, fallback=fallback))`, for any JSON root, and raises ValueError in the same
+    cases.
     """
-    return cast(JSON, json.loads(serialize_json(obj, fallback=fallback)))
+    text = serialize_json(obj, fallback=fallback)
+    try:
+        return cast(JSON, json.loads(text))
+    except RecursionError as error:
+        raise ValueError(_NESTED_TOO_DEEPLY) from error
 
 
 def serialize_json_as_dict(obj: Any, *, fallback: Fallback | None = None) -> "JSON":

@@ -207,6 +207,43 @@ def _require_json_array(data: Any, cls: Any) -> None:
         raise TypeError(f"Expected a JSON array for {cls}, got {type(data).__name__}")
 
 
+_JSON_CONTAINER_TYPES = frozenset((dict, list))
+
+
+def _copy_json(value: Any) -> Any:
+    """Copy the JSON containers in `value`, so that the result shares no mutable container with it.
+
+    Used where deserialization passes input through as is. Only exact dicts and lists (what `json.loads` builds) are
+    copied, at any depth; anything else, such as scalars, tuples, dict or list subclasses and other objects, is kept by
+    reference along with what it contains. Iterative, so the nesting depth is not limited by recursion; repeated and
+    cyclic references are preserved.
+    """
+    if type(value) is not dict and type(value) is not list:
+        return value
+
+    root = value.copy()
+    copies = {id(value): root}
+    pending = [root]
+    while pending:
+        container = pending.pop()
+        if type(container) is dict:
+            entries = container.items()
+        elif _JSON_CONTAINER_TYPES.isdisjoint(map(type, container)):
+            # a list of scalars only (checked at C speed): its shallow copy is complete
+            continue
+        else:
+            entries = enumerate(container)
+        for key, item in entries:
+            item_type = type(item)
+            if item_type is dict or item_type is list:
+                item_copy = copies.get(id(item))
+                if item_copy is None:
+                    item_copy = copies[id(item)] = item.copy()
+                    pending.append(item_copy)
+                container[key] = item_copy
+    return root
+
+
 # Abstract base class for JSON serializing handlers
 class JsonSerializingHandler(Generic[T], ABC):
 
@@ -232,7 +269,8 @@ class NumpyTypeJsonSerializingHandler(JsonSerializingHandler):
     @staticmethod
     def deserialize(data: JSON, cls: type) -> Any:
         from jserpy._numpy import deserialize_numpy
-        return deserialize_numpy(data, cls, "scalar")
+        # copied, since np.object_(x) returns x itself
+        return deserialize_numpy(_copy_json(data), cls, "scalar")
 
 
 # Handler for Jsonable objects
@@ -261,7 +299,7 @@ class TupleJsonSerializingHandler(JsonSerializingHandler[tuple]):
         _require_json_array(data, cls)
         generic_args_types = get_args(cls)
         if not generic_args_types:
-            return tuple(data)
+            return tuple(_copy_json(data if type(data) is list else list(data)))
 
         if len(generic_args_types) == 2 and generic_args_types[1] is Ellipsis:
             _deserialize = partial(deserialize_json, cls=generic_args_types[0])
@@ -298,7 +336,7 @@ class ListJsonSerializingHandler(JsonSerializingHandler[list]):
             return data
         _require_json_array(data, cls)
         if not generic_args:
-            return data if isinstance(data, list) else list(data)
+            return _copy_json(data if type(data) is list else list(data))
 
         generic_type = generic_args[0]
         _deserialize = partial(deserialize_json, cls=generic_type)
@@ -354,9 +392,12 @@ class MappingJsonSerializingHandler(JsonSerializingHandler):
             if key_cls is not Any:
                 data = _deserialize_keys(data, key_cls)
             data = {k: deserialize_json(v, value_cls) for k, v in data.items()}
+        else:
+            # the values are passed through as is: copy them, so that the result does not alias the input
+            data = _copy_json(data if type(data) is dict else dict(data))
         if issubclass(cls_origin, MappingProxyType):
-            return MappingProxyType(dict(data))
-        return dict(data)
+            return MappingProxyType(data)
+        return data
 
 
 class LiteralJsonSerializingHandler(JsonSerializingHandler):
@@ -440,7 +481,11 @@ class NumpyJsonSerializingHandler(JsonSerializingHandler):
     @staticmethod
     def deserialize(data: JSON, cls: type) -> Any:
         from jserpy._numpy import deserialize_numpy
-        return deserialize_numpy(data, cls, "array")
+        array = deserialize_numpy(data, cls, "array")
+        if array.dtype == object:
+            # an object array holds the input's own dicts and lists: build it from a copy instead
+            array = deserialize_numpy(_copy_json(data), cls, "array")
+        return array
 
 
 class BytesJsonSerializingHandler(JsonSerializingHandler):
@@ -690,7 +735,7 @@ def serialize_json_as_dict(obj: Any, *, fallback: Fallback | None = None) -> "JS
 
 def deserialize_json(data: JSON, cls: type[T]) -> T:
     if cls is Any:
-        return data
+        return _copy_json(data)
 
     if cls is float and type(data) is int:
         # JSON from non-Python encoders may write whole floats as ints
@@ -711,7 +756,7 @@ def deserialize_json(data: JSON, cls: type[T]) -> T:
             if issubclass(origin_type, dict):
                 key_cls, value_cls = get_args(cls)
                 data = _deserialize_keys(data, key_cls)
-                data = {k: deserialize_json(v, value_cls) for k, v in data.items()}
+                return {k: deserialize_json(v, value_cls) for k, v in data.items()}
 
         elif issubclass(cls, Jsonable):
             return JsonableSerializingHandler.deserialize(data, cls)
@@ -719,7 +764,8 @@ def deserialize_json(data: JSON, cls: type[T]) -> T:
         elif is_dataclass(cls):
             return DataclassJsonSerializingHandler.deserialize(data, cls)
 
-        return data
+        # passed through as is (e.g. an unparameterized `dict`): copy, so that the result does not alias the input
+        return _copy_json(data)
 
     if is_json_primitive(data):
         return data

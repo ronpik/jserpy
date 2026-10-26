@@ -200,6 +200,13 @@ def _deserialize_keys(obj: Any, keys_cls: Type[T]) -> Any:
     return {_reconstruct_key(k, keys_cls): v for k, v in obj.items()}
 
 
+def _require_json_array(data: Any, cls: Any) -> None:
+    # A str, bytes or dict is iterable too, and would be split into characters, byte values or keys. Raise
+    # TypeError (like the other handlers) so that unions try their next member; name types, never the value.
+    if not isinstance(data, (list, tuple)):
+        raise TypeError(f"Expected a JSON array for {cls}, got {type(data).__name__}")
+
+
 # Abstract base class for JSON serializing handlers
 class JsonSerializingHandler(Generic[T], ABC):
 
@@ -251,6 +258,7 @@ class TupleJsonSerializingHandler(JsonSerializingHandler[tuple]):
         # if not isinstance(cls, GenericAlias):
         #     return tuple(data)
 
+        _require_json_array(data, cls)
         generic_args_types = get_args(cls)
         if not generic_args_types:
             return tuple(data)
@@ -268,6 +276,10 @@ class TupleJsonSerializingHandler(JsonSerializingHandler[tuple]):
             _deserialize = partial(deserialize_json, cls=generic_type)
             return tuple(map(_deserialize, data))
 
+        raise TypeError(
+            f"Expected a JSON array of length {len(generic_args_types)} for {cls}, got length {len(data)}"
+        )
+
 
 class ListJsonSerializingHandler(JsonSerializingHandler[list]):
 
@@ -280,11 +292,15 @@ class ListJsonSerializingHandler(JsonSerializingHandler[list]):
         # if not isinstance(cls, GenericAlias):
         #     return data
 
-        if not is_generic_type(cls):
+        generic_args = get_args(cls)
+        if not generic_args and data is None:
+            # an unparameterized list passes null through (e.g. a missing dataclass field), as before
             return data
+        _require_json_array(data, cls)
+        if not generic_args:
+            return data if isinstance(data, list) else list(data)
 
-        cls_generic = cast(GenericAlias, cls)
-        generic_type = get_args(cls_generic)[0]
+        generic_type = generic_args[0]
         _deserialize = partial(deserialize_json, cls=generic_type)
         return list(map(_deserialize, data))
 
@@ -309,6 +325,7 @@ class SetJsonSerializingHandler(JsonSerializingHandler[set[Any] | frozenset[Any]
 
     @staticmethod
     def deserialize(data: JSON, cls: type[set[Any] | frozenset[Any]]) -> set[Any] | frozenset[Any]:
+        _require_json_array(data, cls)
         cls_origin = get_origin(cls) or cls
         generic_args = get_args(cls)
         values = data
@@ -717,4 +734,4 @@ def deserialize_multi_cls_from_json(data: JSON, cls_list: Sequence[type[T]]) -> 
         except TypeError:
             continue
 
-    raise TypeError(f"Unsupported types for deserialization: {cls_list}")
+    raise TypeError(f"Unsupported types for deserialization: {cls_list}, got {type(data).__name__}")

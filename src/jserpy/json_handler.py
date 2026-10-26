@@ -294,6 +294,23 @@ def _require_json_array(data: Any, cls: Any) -> None:
         raise TypeError(f"Expected a JSON array for {cls}, got {type(data).__name__}")
 
 
+# What a failed conversion such as `Enum(...)`, `Decimal(...)`, `fromisoformat` or `b64decode` raises
+_CONVERSION_ERRORS = (ValueError, TypeError, ArithmeticError)
+
+
+def _convert(data: Any, cls: Any, convert: Callable[[Any], T]) -> T:
+    """Return `convert(data)`, raising a TypeError that names types only if the conversion fails.
+
+    The original errors often echo the value (e.g. "'x' is not a valid Color") and are not always TypeErrors, which
+    unions need to try their next member. The original is dropped, not chained or kept as `__context__`.
+    """
+    try:
+        return convert(data)
+    except _CONVERSION_ERRORS:
+        pass
+    raise TypeError(f"Invalid value for {cls}, got {type(data).__name__}")
+
+
 _JSON_CONTAINER_TYPES = frozenset((dict, list))
 
 
@@ -357,7 +374,7 @@ class NumpyTypeJsonSerializingHandler(JsonSerializingHandler):
     def deserialize(data: JSON, cls: type) -> Any:
         from jserpy._numpy import deserialize_numpy
         # copied, since np.object_(x) returns x itself
-        return deserialize_numpy(_copy_json(data), cls, "scalar")
+        return _convert(_copy_json(data), cls, partial(deserialize_numpy, cls=cls, kind="scalar"))
 
 
 # Handler for Jsonable objects
@@ -499,7 +516,7 @@ class LiteralJsonSerializingHandler(JsonSerializingHandler):
         # compare type too, so that e.g. 1 / True do not match each other
         if any(type(data) is type(value) and data == value for value in allowed):
             return data
-        raise TypeError(f"Value {data!r} is not one of the allowed literals {allowed}")
+        raise TypeError(f"Expected one of the allowed literals {allowed}, got {type(data).__name__}")
 
 
 class UnionJsonSerializingHandler(JsonSerializingHandler):
@@ -586,7 +603,7 @@ class BytesJsonSerializingHandler(JsonSerializingHandler):
     @staticmethod
     def deserialize(data: JSON, cls: type[bytes]) -> bytes:
         # Decode Base64 string back to bytes
-        return base64.b64decode(data)
+        return _convert(data, cls, base64.b64decode)
 
 
 class DatetimeJsonSerializingHandler(JsonSerializingHandler):
@@ -598,7 +615,7 @@ class DatetimeJsonSerializingHandler(JsonSerializingHandler):
 
     @staticmethod
     def deserialize(data: JSON, cls: type[datetime.datetime]) -> T:
-        return cls.fromisoformat(data)
+        return _convert(data, cls, cls.fromisoformat)
 
 
 class DecimalJsonSerializingHandler(JsonSerializingHandler[Decimal]):
@@ -610,7 +627,7 @@ class DecimalJsonSerializingHandler(JsonSerializingHandler[Decimal]):
 
     @staticmethod
     def deserialize(data: JSON, cls: type[Decimal]) -> Decimal:
-        return cls(data)
+        return _convert(data, cls, cls)
 
 
 # Handler for Enum objects
@@ -622,7 +639,7 @@ class EnumJsonSerializingHandler(JsonSerializingHandler):
 
     @staticmethod
     def deserialize(data: JSON, cls: type[T]) -> T:
-        return cls(data)
+        return _convert(data, cls, cls)
 
 
 def is_json_primitive(data: JSON) -> bool:

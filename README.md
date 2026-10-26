@@ -110,6 +110,8 @@ JSerPy supports JSON primitives and containers together with:
 
 Enum and tuple dictionary keys are supported. Serialization raises an error
 rather than silently losing data when distinct keys produce the same JSON key.
+Cyclic references, and structures nested more deeply than the `json` module can
+encode, raise `ValueError` as well.
 
 ## Contributing
 

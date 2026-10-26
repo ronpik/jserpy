@@ -113,6 +113,12 @@ rather than silently losing data when distinct keys produce the same JSON key.
 Cyclic references, and structures nested more deeply than the `json` module can
 encode, raise `ValueError` as well.
 
+`deserialize_json()` walks nested values without recursion, so recursive
+dataclasses and containers deserialize as deeply as `json.loads()` parses.
+`Jsonable.from_json()` implementations that call `deserialize_json()` themselves
+still recurse: beyond the Python recursion limit, the outermost call raises
+`ValueError`, as it does for input that never stops nesting (cyclic input).
+
 ## Contributing
 
 Contributions are welcome. Run the test suite with:

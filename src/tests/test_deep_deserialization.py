@@ -34,8 +34,9 @@ DEPTH = 5000
 LOWERED_LIMIT_HEADROOM = 150
 # Bound of the walk while testing input that never stops nesting: reached quickly, unlike the real one
 SMALL_BOUND = 1000
-# Levels kept below the probed stdlib ceiling, for the frames jserpy spends above `json.dumps`
-STDLIB_DEPTH_MARGIN = 20
+# Levels kept below the probed ceiling of the round trip through JSON text, for the frames the test spends above it
+ROUND_TRIP_DEPTH_MARGIN = 20
+SERIALIZED_TOO_DEEPLY = "JSON structure is nested too deeply to serialize"
 
 
 @dataclass
@@ -227,17 +228,29 @@ def test_values_and_side_effects_keep_the_recursive_order():
     assert BUILT == ["first", "a1", "a2", "a", "b", "second", "root"]
 
 
-def stdlib_round_trip_depth(cap: int) -> int:
-    """Return the deepest node chain, up to `cap`, whose plain JSON the stdlib dumps and parses here.
+def node_chain(depth: int) -> Node | None:
+    node = None
+    for level in range(depth):
+        node = Node(level, node)
+    return node
 
-    Probed by binary search, because the stdlib ceiling depends on the version (3.10/3.11 count the C encoder
-    against the recursion limit, 3.12/3.13 have a separate C recursion limit, 3.14 checks the C stack size).
+
+def text_round_trip_depth(cap: int) -> int:
+    """Return the deepest node chain, up to `cap`, that `serialize_json` writes and `json.loads` parses here.
+
+    Probed by binary search, because the ceiling depends on the version: 3.10/3.11 count the C encoder against the
+    recursion limit, and every dataclass level also costs Python frames in `CustomEncoder.default` (about 500 levels
+    there); 3.12/3.13 have a separate C recursion limit, and 3.14 checks the C stack size.
     """
 
     def handled(depth: int) -> bool:
         try:
-            json.loads(json.dumps(node_data(depth)))
+            json.loads(serialize_json(node_chain(depth)))
         except RecursionError:
+            return False
+        except ValueError as error:
+            if str(error) != SERIALIZED_TOO_DEEPLY:
+                raise
             return False
         return True
 
@@ -254,14 +267,11 @@ def stdlib_round_trip_depth(cap: int) -> int:
 
 
 def test_deep_dataclass_chain_round_trips_through_json_text():
-    depth = stdlib_round_trip_depth(DEPTH) - STDLIB_DEPTH_MARGIN
+    depth = text_round_trip_depth(DEPTH) - ROUND_TRIP_DEPTH_MARGIN
     if depth <= OLD_DEPTH_LIMIT:
-        pytest.skip(f"the stdlib json module handles only {depth + STDLIB_DEPTH_MARGIN} levels here")
-    node = None
-    for level in range(depth):
-        node = Node(level, node)
+        pytest.skip(f"node chains round trip through JSON text only {depth + ROUND_TRIP_DEPTH_MARGIN} levels deep here")
 
-    result = run(deserialize_json, json.loads(run(serialize_json, node)), Node)
+    result = run(deserialize_json, json.loads(run(serialize_json, node_chain(depth))), Node)
 
     for level in reversed(range(depth)):
         assert type(result) is Node and result.value == level

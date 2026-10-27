@@ -3,11 +3,13 @@ import datetime
 import json
 import typing
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal
 from functools import lru_cache, partial
+from itertools import repeat
 from types import GenericAlias, MappingProxyType, UnionType
 from typing import Any, TypeVar, Generic, cast, Type, get_origin, get_args, Sequence, Union, Tuple
 # from typing import Union as UnionType
@@ -34,12 +36,18 @@ def _type_name(value: Any) -> str:
 
 
 _NESTED_TOO_DEEPLY = "JSON structure is nested too deeply to serialize"
+_NESTED_TOO_DEEPLY_TO_DESERIALIZE = "JSON structure is nested too deeply to deserialize"
 # Bound of the explicit stack of `_SerializationContext.prepare`, for values that never stop nesting (e.g. a handler
 # that returns a new container of its own type). Well above what the stdlib encoder handles: about 10_000 levels up to
 # 3.13 and about 100_000 on 3.14 (8 MiB stack).
 _MAX_PREPARE_DEPTH = 200_000
+# Bound of the explicit stack of `_deserialize`, for input that never stops nesting (a cyclic dict or list). The same
+# as `_MAX_PREPARE_DEPTH`: a typed level takes one or two entries (e.g. a union and a dataclass), and `json.loads`
+# parses about 10_000 levels up to 3.13 and about 100_000 on 3.14.
+_MAX_DESERIALIZE_DEPTH = 200_000
 
-# Kinds of `_Frame`; `_PENDING` stands for a prepared value that is not ready yet (see `_SerializationContext.prepare`)
+# Kinds of `_Frame`; `_PENDING` stands for a prepared (or deserialized) value that is not ready yet (see
+# `_SerializationContext.prepare` and `_deserialize`)
 _MAPPING_FRAME = 0
 _LIST_FRAME = 1
 _TUPLE_FRAME = 2
@@ -287,6 +295,18 @@ def _deserialize_keys(obj: Any, keys_cls: Type[T]) -> Any:
     return {_reconstruct_key(k, keys_cls): v for k, v in obj.items()}
 
 
+# Steps of deserializing a container: a generator that yields `(data, cls)` for every nested value, receives the
+# deserialized value back (or has the error raised at the `yield`), and returns the deserialized container
+_DeserializeSteps = Generator[tuple[Any, Any], Any, Any]
+
+
+def _dict_value_steps(data: dict, value_cls: Any) -> _DeserializeSteps:
+    values = {}
+    for key, value in data.items():
+        values[key] = yield value, value_cls
+    return values
+
+
 def _require_json_array(data: Any, cls: Any) -> None:
     # A str, bytes or dict is iterable too, and would be split into characters, byte values or keys. Raise
     # TypeError (like the other handlers) so that unions try their next member; name types, never the value.
@@ -350,6 +370,9 @@ def _copy_json(value: Any) -> Any:
 
 # Abstract base class for JSON serializing handlers
 class JsonSerializingHandler(Generic[T], ABC):
+    # Handlers of containers define `deserialize_steps(data, cls) -> _DeserializeSteps`, which `deserialize_json`
+    # runs instead of `deserialize` so that nested values cost no Python frames (see `_deserialize`)
+    deserialize_steps: Callable[[Any, Any], _DeserializeSteps] | None = None
 
     @staticmethod
     @abstractmethod
@@ -397,30 +420,30 @@ class TupleJsonSerializingHandler(JsonSerializingHandler[tuple]):
 
     @staticmethod
     def deserialize(data: JSON, cls: type[tuple]) -> tuple:
-        # if not isinstance(cls, GenericAlias):
-        #     return tuple(data)
+        return _run_deserialize_steps(TupleJsonSerializingHandler.deserialize_steps(data, cls))
 
+    @staticmethod
+    def deserialize_steps(data: JSON, cls: type[tuple]) -> _DeserializeSteps:
         _require_json_array(data, cls)
         generic_args_types = get_args(cls)
         if not generic_args_types:
             return tuple(_copy_json(data if type(data) is list else list(data)))
 
         if len(generic_args_types) == 2 and generic_args_types[1] is Ellipsis:
-            _deserialize = partial(deserialize_json, cls=generic_args_types[0])
-            return tuple(map(_deserialize, data))
-
-        if len(data) == len(generic_args_types):
-            tuple_data = (deserialize_json(item, arg_cls) for item, arg_cls in zip(data, generic_args_types))
-            return tuple(tuple_data)
-
+            item_types = repeat(generic_args_types[0])
+        elif len(data) == len(generic_args_types):
+            item_types = generic_args_types
         elif len(generic_args_types) == 1:
-            generic_type = generic_args_types[0]
-            _deserialize = partial(deserialize_json, cls=generic_type)
-            return tuple(map(_deserialize, data))
+            item_types = repeat(generic_args_types[0])
+        else:
+            raise TypeError(
+                f"Expected a JSON array of length {len(generic_args_types)} for {cls}, got length {len(data)}"
+            )
 
-        raise TypeError(
-            f"Expected a JSON array of length {len(generic_args_types)} for {cls}, got length {len(data)}"
-        )
+        items = []
+        for item, item_type in zip(data, item_types):
+            items.append((yield item, item_type))
+        return tuple(items)
 
 
 class ListJsonSerializingHandler(JsonSerializingHandler[list]):
@@ -431,9 +454,10 @@ class ListJsonSerializingHandler(JsonSerializingHandler[list]):
 
     @staticmethod
     def deserialize(data: JSON, cls: type[list]) -> list:
-        # if not isinstance(cls, GenericAlias):
-        #     return data
+        return _run_deserialize_steps(ListJsonSerializingHandler.deserialize_steps(data, cls))
 
+    @staticmethod
+    def deserialize_steps(data: JSON, cls: type[list]) -> _DeserializeSteps:
         generic_args = get_args(cls)
         if not generic_args and data is None:
             # an unparameterized list passes null through (e.g. a missing dataclass field), as before
@@ -443,8 +467,10 @@ class ListJsonSerializingHandler(JsonSerializingHandler[list]):
             return _copy_json(data if type(data) is list else list(data))
 
         generic_type = generic_args[0]
-        _deserialize = partial(deserialize_json, cls=generic_type)
-        return list(map(_deserialize, data))
+        items = []
+        for item in data:
+            items.append((yield item, generic_type))
+        return items
 
 
 class GenericJsonSerializingHandler(JsonSerializingHandler[GenericAlias]):
@@ -467,13 +493,19 @@ class SetJsonSerializingHandler(JsonSerializingHandler[set[Any] | frozenset[Any]
 
     @staticmethod
     def deserialize(data: JSON, cls: type[set[Any] | frozenset[Any]]) -> set[Any] | frozenset[Any]:
+        return _run_deserialize_steps(SetJsonSerializingHandler.deserialize_steps(data, cls))
+
+    @staticmethod
+    def deserialize_steps(data: JSON, cls: type[set[Any] | frozenset[Any]]) -> _DeserializeSteps:
         _require_json_array(data, cls)
         cls_origin = get_origin(cls) or cls
         generic_args = get_args(cls)
         values = data
         if generic_args:
             item_type = generic_args[0]
-            values = [deserialize_json(item, item_type) for item in data]
+            values = []
+            for item in data:
+                values.append((yield item, item_type))
         return cls_origin(values)
 
 
@@ -487,6 +519,10 @@ class MappingJsonSerializingHandler(JsonSerializingHandler):
 
     @staticmethod
     def deserialize(data: JSON, cls: type[Mapping]) -> Mapping:
+        return _run_deserialize_steps(MappingJsonSerializingHandler.deserialize_steps(data, cls))
+
+    @staticmethod
+    def deserialize_steps(data: JSON, cls: type[Mapping]) -> _DeserializeSteps:
         if not isinstance(data, dict):
             raise TypeError(f"Expected a JSON object for {cls}, got {type(data).__name__}")
         cls_origin = get_origin(cls) or cls
@@ -495,7 +531,7 @@ class MappingJsonSerializingHandler(JsonSerializingHandler):
             key_cls, value_cls = generic_args
             if key_cls is not Any:
                 data = _deserialize_keys(data, key_cls)
-            data = {k: deserialize_json(v, value_cls) for k, v in data.items()}
+            data = yield from _dict_value_steps(data, value_cls)
         else:
             # the values are passed through as is: copy them, so that the result does not alias the input
             data = _copy_json(data if type(data) is dict else dict(data))
@@ -536,6 +572,9 @@ def _resolved_field_types(cls: type) -> dict[str, Any]:
     """Resolve string annotations (e.g. `from __future__ import annotations`) once per class."""
     try:
         return typing.get_type_hints(cls)
+    except RecursionError:
+        # raised when called near the recursion limit, not because of `cls`: propagate it instead of caching `{}`
+        raise
     except Exception:
         return {}
 
@@ -551,6 +590,10 @@ class DataclassJsonSerializingHandler(JsonSerializingHandler[DC]):
 
     @staticmethod
     def deserialize(data: JSON, cls: type[DC]) -> DC:
+        return _run_deserialize_steps(DataclassJsonSerializingHandler.deserialize_steps(data, cls))
+
+    @staticmethod
+    def deserialize_steps(data: JSON, cls: type[DC]) -> _DeserializeSteps:
         kwargs = {}
         resolved_types = _resolved_field_types(cls)
         # Iterate through each field of the dataclass
@@ -568,7 +611,7 @@ class DataclassJsonSerializingHandler(JsonSerializingHandler[DC]):
                     #           f"in the data object with keys: {list(data.keys())}")
                 field_value = None
 
-            deserialized_value = deserialize_json(field_value, field_type)
+            deserialized_value = yield field_value, field_type
             kwargs[field_name] = deserialized_value
 
         return cls(**kwargs)
@@ -852,7 +895,82 @@ def serialize_json_as_dict(obj: Any, *, fallback: Fallback | None = None) -> "JS
     return serialize_json_as_obj(obj, fallback=fallback)
 
 
+# Whether a `deserialize_json` call is in progress in this context (see `deserialize_json`)
+_deserializing: ContextVar[bool] = ContextVar("jserpy_deserializing", default=False)
+
+
 def deserialize_json(data: JSON, cls: type[T]) -> T:
+    """Deserialize `data`, a JSON value as returned by `json.loads`, to an instance of `cls`.
+
+    Raises TypeError when `data` does not match `cls`, and ValueError for a structure nested too deeply: more deeply
+    than the Python recursion limit allows through `Jsonable.from_json` implementations that call `deserialize_json`
+    themselves, or beyond what the `json` module parses (for example cyclic input).
+    """
+    if _deserializing.get():
+        # Called by a handler or a `Jsonable.from_json` during an outer call: a RecursionError passes through them
+        # unchanged, as before, and the outermost call reports it
+        return _deserialize(data, cls)
+
+    token = _deserializing.set(True)
+    try:
+        return _deserialize(data, cls)
+    except RecursionError as error:
+        raise ValueError(_NESTED_TOO_DEEPLY_TO_DESERIALIZE) from error
+    finally:
+        _deserializing.reset(token)
+
+
+def _deserialize(data: JSON, cls: Any) -> Any:
+    # A depth-first walk with an explicit stack of the containers' `_DeserializeSteps` instead of recursion, so that
+    # the nesting depth costs no Python frames. Values are deserialized, and errors raised and caught (e.g. by unions),
+    # in the same order as by recursive calls.
+    stack: list[_DeserializeSteps] = []
+    result = _enter_deserialization(data, cls, stack)
+    if result is _PENDING:
+        result = _run_deserialize_steps_stack(stack)
+    return result
+
+
+def _run_deserialize_steps(steps: _DeserializeSteps) -> Any:
+    return _run_deserialize_steps_stack([steps])
+
+
+def _run_deserialize_steps_stack(stack: list[_DeserializeSteps]) -> Any:
+    """Run the steps on `stack` to the end and return the result of the bottom ones."""
+    result: Any = None  # sent to the steps on top: None starts new steps
+    error: BaseException | None = None  # raised in the steps on top instead
+    while stack:
+        steps = stack[-1]
+        try:
+            if error is None:
+                data, cls = steps.send(result)
+            else:
+                data, cls = steps.throw(error)
+        except StopIteration as stop:
+            stack.pop()
+            result, error = stop.value, None
+            continue
+        except BaseException as raised:
+            stack.pop()
+            error = raised
+            continue
+
+        error = None
+        try:
+            result = _enter_deserialization(data, cls, stack)
+        except BaseException as raised:
+            error = raised
+        else:
+            if result is _PENDING:
+                result = None
+
+    if error is not None:
+        raise error
+    return result
+
+
+def _enter_deserialization(data: JSON, cls: Any, stack: list[_DeserializeSteps]) -> Any:
+    """Return `data` deserialized as `cls`, or `_PENDING` after pushing the steps of a container onto `stack`."""
     if cls is Any:
         return _copy_json(data)
 
@@ -866,8 +984,13 @@ def deserialize_json(data: JSON, cls: type[T]) -> T:
         return None
 
     handler = _get_handler(cls)
+    if handler is UnionJsonSerializingHandler:
+        return _enter_union_deserialization(data, get_args(cls), stack)
     if handler is not None:
-        return handler.deserialize(data, cls)
+        deserialize_steps = handler.deserialize_steps
+        if deserialize_steps is None:
+            return handler.deserialize(data, cls)
+        return _push_deserialize_steps(deserialize_steps(data, cls), stack)
 
     if isinstance(data, dict):
         if is_generic_type(cls):
@@ -875,13 +998,13 @@ def deserialize_json(data: JSON, cls: type[T]) -> T:
             if issubclass(origin_type, dict):
                 key_cls, value_cls = get_args(cls)
                 data = _deserialize_keys(data, key_cls)
-                return {k: deserialize_json(v, value_cls) for k, v in data.items()}
+                return _push_deserialize_steps(_dict_value_steps(data, value_cls), stack)
 
         elif issubclass(cls, Jsonable):
             return JsonableSerializingHandler.deserialize(data, cls)
 
         elif is_dataclass(cls):
-            return DataclassJsonSerializingHandler.deserialize(data, cls)
+            return _push_deserialize_steps(DataclassJsonSerializingHandler.deserialize_steps(data, cls), stack)
 
         # passed through as is (e.g. an unparameterized `dict`): copy, so that the result does not alias the input
         return _copy_json(data)
@@ -892,11 +1015,57 @@ def deserialize_json(data: JSON, cls: type[T]) -> T:
     raise TypeError(f"Unsupported type for deserialization: {cls}")
 
 
-def deserialize_multi_cls_from_json(data: JSON, cls_list: Sequence[type[T]]) -> T:
-    for cls in cls_list:
+def _push_deserialize_steps(steps: _DeserializeSteps, stack: list[_DeserializeSteps]) -> Any:
+    if len(stack) >= _MAX_DESERIALIZE_DEPTH:
+        raise ValueError(_NESTED_TOO_DEEPLY_TO_DESERIALIZE)
+    stack.append(steps)
+    return _PENDING
+
+
+def _enter_union_deserialization(data: JSON, cls_list: Sequence[Any], stack: list[_DeserializeSteps]) -> Any:
+    """Like `_enter_deserialization` with `_multi_cls_steps`, but members that are not containers are tried here.
+
+    Most unions (e.g. `Optional[str]`) then need no steps of their own; they are pushed only under a container member.
+    """
+    for index, cls in enumerate(cls_list):
+        depth = len(stack)
         try:
-            return deserialize_json(data, cls)
+            result = _enter_deserialization(data, cls, stack)
+        except TypeError:
+            continue
+        if result is _PENDING:
+            # The member's steps run later: the steps under them try the remaining members if they raise TypeError
+            steps = _multi_cls_steps(data, cls_list, running=index)
+            next(steps)
+            stack.insert(depth, steps)
+        return result
+
+    raise _no_matching_cls(data, cls_list)
+
+
+def deserialize_multi_cls_from_json(data: JSON, cls_list: Sequence[type[T]]) -> T:
+    return _run_deserialize_steps(_multi_cls_steps(data, cls_list))
+
+
+def _multi_cls_steps(data: JSON, cls_list: Sequence[Any], running: int = -1) -> _DeserializeSteps:
+    """Try the members of `cls_list` in order until one does not raise TypeError.
+
+    With `running`, the steps of that member are on the stack above these ones already: the first `yield`, reached by
+    priming these steps with `next()`, receives its result.
+    """
+    if running >= 0:
+        try:
+            return (yield)
+        except TypeError:
+            pass
+    for cls in cls_list[running + 1:]:
+        try:
+            return (yield data, cls)
         except TypeError:
             continue
 
-    raise TypeError(f"Unsupported types for deserialization: {cls_list}, got {type(data).__name__}")
+    raise _no_matching_cls(data, cls_list)
+
+
+def _no_matching_cls(data: JSON, cls_list: Sequence[Any]) -> TypeError:
+    return TypeError(f"Unsupported types for deserialization: {cls_list}, got {type(data).__name__}")

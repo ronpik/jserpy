@@ -1154,17 +1154,24 @@ def test_enum_keys_with_string_values_are_restored_as_members(key, annotation):
         pytest.param(Level.HIGH, Level, id="int-enum"),
         pytest.param(Ratio.HALF, Ratio, id="float-enum"),
         pytest.param(Switch.ON, Switch, id="bool-enum"),
-        pytest.param(Perm.READ | Perm.WRITE, Perm, id="flag"),
         pytest.param(Bits.ONE, Bits, id="int-mixin-enum"),
         pytest.param(Scale.HALF, Scale, id="float-mixin-enum"),
     ],
 )
-def test_enum_keys_with_non_string_values_cannot_be_restored_limitation(key, annotation):
-    # documents current behavior, not a promise: a JSON key is always a string and is looked up as is
-    text = serialize_json({key: 1})
+def test_enum_keys_with_non_string_values_are_restored_as_members(key, annotation):
+    # the key text of a member is that of its value ("2", "0.5", "true"): the member whose key text matches is restored
+    restored = assert_round_trip({key: [1]}, dict[annotation, list[int]])
+
+    assert next(iter(restored)) is key
+
+
+def test_flag_combination_keys_cannot_be_restored_limitation():
+    # documents current behavior, not a promise: a combination of flags is no member of the enum, so no member has the
+    # key text of its value
+    text = serialize_json({Perm.READ | Perm.WRITE: 1})
 
     with pytest.raises(TypeError, match="Invalid value for"):
-        deserialize_json(json.loads(text), dict[annotation, int])
+        deserialize_json(json.loads(text), dict[Perm, int])
 
 
 @pytest.mark.parametrize(
@@ -1525,12 +1532,6 @@ def test_unicode_path_with_ensure_ascii_false():
 OTHER_FLAVOUR = PureWindowsPath("C:/Users/x") if os.name == "posix" else PurePosixPath("/usr/local/x")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="the Path handler ignores cls and always builds a Path of the running platform, so a pure path of the "
-           "other flavour and a Path subclass come back as a different, unequal type",
-)
 @pytest.mark.parametrize(
     ("value", "annotation"),
     [
@@ -1552,13 +1553,11 @@ def test_path_annotation_restores_an_instance_of_that_annotation(value, annotati
         pytest.param(type(PurePath())("a/b"), type(PurePath()), id="pure-path-of-the-running-platform"),
     ],
 )
-def test_pure_path_annotation_restores_the_concrete_platform_path_limitation(value, annotation):
-    # documents current behavior, not a promise: a Path is a pure path of its own flavour, so it is an instance of the
-    # annotation and equal to the original, but not the exact type that went in
+def test_pure_path_annotation_restores_the_pure_path_of_the_running_platform(value, annotation):
+    # PurePath(...) itself makes the pure path of the running platform, which is what PurePath("a/b") is here too
     restored = deserialize_json(json.loads(serialize_json(value)), annotation)
 
-    assert type(restored) is type(Path())
-    assert isinstance(restored, annotation)
+    assert type(restored) is type(value)
     assert restored == value
 
 
@@ -1666,11 +1665,6 @@ def test_enum_keyed_dicts_of_leaf_values_round_trip():
     assert_round_trip(value, Prices)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=TypeError,
-    reason="a tuple-valued member is written as an array, which Enum lookup by tuple value cannot match",
-)
 @pytest.mark.parametrize(
     ("obj", "annotation", "text"),
     [
@@ -1764,7 +1758,7 @@ def test_bytes_before_str_in_a_union_swallows_base64_looking_text_limitation():
 # --- subclasses of leaf types ------------------------------------------------------------------------------------
 
 # Subclasses of str, int, float, Path and Enum are written like their base (the encoder or the handler lookup sees the
-# base). The handlers of these five are found by exact type, so a subclass is not recognized at all.
+# base), and so are those of datetime, date, time, Decimal and bytes (their handlers are found along the MRO).
 # (value, JSON text, the handled base type)
 SUBCLASS_CASES = [
     pytest.param(FakeDatetime(2024, 2, 29, 12, 34, 56), '"2024-02-29T12:34:56"', datetime, id="datetime-subclass"),
@@ -1788,29 +1782,38 @@ def test_subclasses_of_natively_supported_types_are_written_like_their_base(valu
     assert serialize_json(value) == text
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=TypeError,
-    reason="handlers are found by exact type, so a datetime, date, time, Decimal or bytes subclass is not serializable",
-)
 @pytest.mark.parametrize(("value", "text", "base"), SUBCLASS_CASES)
 def test_subclass_of_a_handled_type_is_written_like_its_base(value, text, base):
     assert serialize_json(value) == text
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="a subclass annotation finds no handler, so the JSON string is passed through unconverted and unvalidated",
-)
 @pytest.mark.parametrize(("value", "text", "base"), SUBCLASS_CASES)
 def test_subclass_annotation_restores_a_value_of_the_handled_base(value, text, base):
-    # whether the result is the subclass or the base is left open (the library builds no subclass for list, tuple or
-    # dict annotations either); what must not happen is that the raw JSON string comes back
+    # the result is an instance of the annotated subclass (what fromisoformat, Decimal() and bytes() build from it)
     restored = deserialize_json(json.loads(text), type(value))
 
+    assert type(restored) is type(value)
     assert isinstance(restored, base)
     assert restored == value
+
+
+@pytest.mark.parametrize(("value", "text", "base"), SUBCLASS_CASES)
+def test_subclass_annotation_still_validates_the_json_string(value, text, base):
+    # not passed through unconverted: a string that is no date, Decimal or Base64 text is a TypeError (unions move on)
+    for data in ("not a value", None, ["x"], {"a": 1}):
+        with pytest.raises(TypeError):
+            deserialize_json(data, type(value))
+
+    assert deserialize_json("not a value", type(value) | str) == "not a value"
+    assert_round_trip([value, value], list[type(value)])
+
+
+def test_most_specific_handler_wins_for_a_datetime_subclass():
+    # a datetime is a date too: its text keeps the time, and the annotation FakeDatetime is not read as a date
+    assert serialize_json(FakeDatetime(2024, 2, 29, 12, 34, 56)) == '"2024-02-29T12:34:56"'
+    assert deserialize_json("2024-02-29T12:34:56", FakeDatetime) == FakeDatetime(2024, 2, 29, 12, 34, 56)
+    with pytest.raises(TypeError):
+        deserialize_json("2024-02-29", FakeTime)
 
 
 # --- leaf values in sets, tuples and tuple keys ------------------------------------------------------------------

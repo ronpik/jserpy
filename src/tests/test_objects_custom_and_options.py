@@ -1464,11 +1464,6 @@ def test_jsonable_mapping_key_is_rejected_limitation():
         pytest.param(NamedFloat(3.5), '{"value": 3.5}', id="float-subclass"),
     ],
 )
-@pytest.mark.xfail(
-    raises=AssertionError,
-    strict=True,
-    reason="to_json of a Jsonable subclassing str, int or float is ignored: the stdlib encoder writes the primitive",
-)
 def test_to_json_of_a_jsonable_subclassing_a_primitive_is_used(value, text):
     assert serialize_json(value) == text
     assert serialize_json([value]) == f"[{text}]"

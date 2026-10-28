@@ -57,6 +57,22 @@ _HANDLER_FRAME = 3
 _PENDING = object()
 
 
+_NATIVE_JSON_TYPES = frozenset((str, int, float, bool, type(None)))
+
+
+def _is_jsonable_primitive(value: Any) -> bool:
+    """Whether `value` is a `Jsonable` that subclasses str, int or float.
+
+    The stdlib encoder writes such a value as the primitive, without calling `default`: it needs to reach its handler
+    before that.
+    """
+    return (
+        type(value) not in _NATIVE_JSON_TYPES
+        and isinstance(value, (str, int, float))
+        and isinstance(value, Jsonable)
+    )
+
+
 class _Frame:
     """An entry of the explicit stack of `_SerializationContext.prepare`.
 
@@ -132,7 +148,7 @@ class _SerializationContext:
             if id(value) in self._active_ids:
                 raise ValueError("Cyclic reference detected during JSON serialization")
 
-            if not isinstance(value, (Mapping, list, tuple)):
+            if not isinstance(value, (Mapping, list, tuple)) and not _is_jsonable_primitive(value):
                 return value
 
             if len(stack) >= _MAX_PREPARE_DEPTH:
@@ -277,6 +293,25 @@ def _restore_tuple_key(key: str, cls: Union[Type[Tuple], GenericAlias]) -> tuple
     raise TypeError(f"Expected a JSON array as the mapping key for {cls}, got text that is not JSON")
 
 
+def _restore_enum_key(key: str, cls: Type[T]) -> T:
+    try:
+        return EnumJsonSerializingHandler.deserialize(key, cls)
+    except TypeError:
+        pass
+
+    # The key text of a member is that of its value (see `_SerializationContext.convert_key`): the value itself for a
+    # str, but "1" for 1, "true" for True, "[0, 0]" for (0, 0)
+    context = _SerializationContext(fallback=None, allow_nan=True)
+    for member in cls:
+        try:
+            member_key = context.convert_key(member)
+        except (TypeError, ValueError):
+            continue
+        if member_key == key:
+            return member
+    raise TypeError(f"Invalid value for {cls}, got {type(key).__name__}")
+
+
 def _reconstruct_key(key: str, cls: Type[T]) -> T:
     # issubclass() takes the origin: it rejects a parameterized `typing.Tuple[...]` (and, from Python 3.13, `tuple[...]`)
     cls_origin = cast(type, get_origin(cls))
@@ -284,7 +319,7 @@ def _reconstruct_key(key: str, cls: Type[T]) -> T:
         cls_origin = cls
 
     if issubclass(cls_origin, Enum):
-        return EnumJsonSerializingHandler.deserialize(key, cls)
+        return _restore_enum_key(key, cls)
 
     if issubclass(cls_origin, tuple):
         return _restore_tuple_key(key, cls)
@@ -759,8 +794,9 @@ class BytesJsonSerializingHandler(JsonSerializingHandler):
 
     @staticmethod
     def deserialize(data: JSON, cls: type[bytes]) -> bytes:
-        # Decode Base64 string back to bytes
-        return _convert(data, cls, base64.b64decode)
+        # Decode Base64 string back to bytes (of the subclass, if that is what is asked for)
+        decoded = _convert(data, cls, base64.b64decode)
+        return decoded if cls is bytes else _convert(decoded, cls, cls)
 
 
 class DatetimeJsonSerializingHandler(JsonSerializingHandler):
@@ -788,6 +824,13 @@ class DecimalJsonSerializingHandler(JsonSerializingHandler[Decimal]):
 
 
 # Handler for Enum objects
+def _is_json_of(value: Any, data: JSON) -> bool:
+    """Whether the parsed JSON `data` is what `value` is written as: a tuple is an array, at any depth."""
+    if isinstance(value, tuple):
+        return type(data) is list and len(value) == len(data) and all(map(_is_json_of, value, data))
+    return value == data
+
+
 class EnumJsonSerializingHandler(JsonSerializingHandler):
 
     @staticmethod
@@ -796,7 +839,18 @@ class EnumJsonSerializingHandler(JsonSerializingHandler):
 
     @staticmethod
     def deserialize(data: JSON, cls: type[T]) -> T:
-        return _convert(data, cls, cls)
+        try:
+            return cls(data)
+        except _CONVERSION_ERRORS:
+            pass
+
+        if type(data) is list:
+            # the value of a member may be a tuple, which was written as an array, and a list is not equal to it
+            for member in cls:
+                if _is_json_of(member.value, data):
+                    return member
+        # raised outside the `except`, so that the original error (it echoes the value) is not kept as `__context__`
+        raise TypeError(f"Invalid value for {cls}, got {type(data).__name__}")
 
 
 def is_json_primitive(data: JSON) -> bool:
@@ -813,8 +867,9 @@ class PathJsonSerializingHandler(JsonSerializingHandler):
 
     @staticmethod
     def deserialize(data: JSON, cls: type[T]) -> T:
-        from pathlib import Path
-        return Path(data)
+        # `cls(data)`, so that a PureWindowsPath stays one and a Path subclass keeps its class (PurePath itself makes
+        # the pure path of the running platform)
+        return _convert(data, cls, cls)
 
 
 
@@ -836,6 +891,11 @@ _handlers: dict[type[T], type[JsonSerializingHandler[T]]] = {
     Mapping: MappingJsonSerializingHandler,
     typing.Literal: LiteralJsonSerializingHandler,
 }
+
+
+# The types whose handlers serve their subclasses as well (found along the MRO, the most specific base first: a
+# datetime is a date too)
+_SUBCLASS_HANDLED_TYPES = frozenset((datetime.datetime, datetime.date, datetime.time, Decimal, bytes))
 
 
 def is_valid_class(cls: Type[T]) -> bool:
@@ -892,6 +952,10 @@ def _get_handler(cls: type[T]) -> typing.Optional[type[JsonSerializingHandler]]:
         return NumpyJsonSerializingHandler
     if numpy_kind == "scalar":
         return NumpyTypeJsonSerializingHandler
+
+    for base in cls_origin.__mro__:
+        if base in _SUBCLASS_HANDLED_TYPES:
+            return _handlers[base]
 
     return None
 

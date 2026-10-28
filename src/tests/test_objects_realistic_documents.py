@@ -880,12 +880,6 @@ def test_windows_path_field_is_serialized_with_its_backslashes():
     assert to_json_value(host) == {"name": "build-01", "install_dir": "C:\\Program Files\\App"}
 
 
-@pytest.mark.xfail(
-    os.name == "posix",
-    raises=AssertionError,
-    strict=True,
-    reason="a PureWindowsPath annotation restores a PosixPath: backslashes stop being separators",
-)
 def test_windows_path_field_restores_as_a_pure_windows_path():
     restored = deserialize_json({"name": "build-01", "install_dir": "C:\\Program Files\\App"}, RemoteHost)
 
@@ -2340,11 +2334,6 @@ def test_dict_keyed_by_an_int_enum_is_written_with_the_member_values_as_keys():
     assert to_json_value(make_sla_table()) == {"hours": {"1": 72, "2": 24, "3": 4}}
 
 
-@pytest.mark.xfail(
-    raises=TypeError,
-    strict=True,
-    reason="the key of an int-valued Enum is written as '1' but restored with Priority('1'), which raises TypeError",
-)
 def test_dict_keyed_by_an_int_enum_round_trips():
     assert_round_trip(make_sla_table(), SlaTable)
 

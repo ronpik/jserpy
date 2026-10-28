@@ -1510,17 +1510,24 @@ def test_enum_keys_with_non_string_values_serialize_as_their_value_text():
         pytest.param(Switch.ON, Switch, id="bool-valued"),
         pytest.param(Ratio.HALF, Ratio, id="float-valued"),
         pytest.param(Blank.NOTHING, Blank, id="null-valued"),
+        pytest.param(Cell.ORIGIN, Cell, id="tuple-valued"),
     ],
 )
-def test_enum_keys_with_non_string_values_cannot_be_restored_limitation(member, enum_type):
-    # Documents current behavior, not a promise: the README lists Enum keys as supported, but a key is restored by
-    # calling the enum with the JSON key text ("1"), which only matches a str-valued member. The same member is
-    # restored fine as a dict value, so the loss is specific to keys (the control below). It is a TypeError that
-    # names the enum and the JSON type only.
-    assert_round_trip([member], list[enum_type])
+def test_enum_keys_with_non_string_values_are_restored_as_members(member, enum_type):
+    # a key is the text of the member value ("1", "true", "0.5", "null", "[0, 0]"): the member with that key text is
+    # restored, not the member whose value equals the text
+    restored = assert_round_trip({member: 1}, dict[enum_type, int])
 
-    with pytest.raises(TypeError, match="Invalid value for .*, got str"):
-        deserialize_json(to_json_value({member: 1}), dict[enum_type, int])
+    assert next(iter(restored)) is member
+
+
+def test_enum_key_that_is_no_members_text_is_a_type_error_naming_the_enum_only():
+    with pytest.raises(TypeError, match="Invalid value for .*, got str") as caught:
+        deserialize_json({"KEY_SENTINEL": 1}, dict[Level, int])
+
+    assert "KEY_SENTINEL" not in str(caught.value)
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+    assert deserialize_json({"KEY_SENTINEL": 1}, Union[dict[Level, int], dict[str, int]]) == {"KEY_SENTINEL": 1}
 
 
 def test_enum_keys_with_str_values_are_restored_from_their_text():

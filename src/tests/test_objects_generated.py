@@ -1462,14 +1462,13 @@ def test_enum_keys_serialize_by_value(key, expected):
         pytest.param({Priority.HIGH: "x", Priority.LOW: "y"}, dict[Priority, str], Priority.HIGH, 10, id="int-enum"),
     ],
 )
-def test_int_valued_enum_keys_cannot_be_restored_limitation(value, annotation, member, raw):
-    # Documents current behavior, not a promise: a JSON key is always a string, the key is looked up as Rank("2")
-    # instead of Rank(2), and so it matches no member. The same enum as a value does round trip (see the leaf cases).
+def test_int_valued_enum_keys_are_restored_as_members(value, annotation, member, raw):
+    # a JSON key is always a string: "2" is looked up as the key text of Rank.SECOND, not as Rank("2")
     parsed = json.loads(serialize_json(value))
     assert all(isinstance(key, str) for key in parsed)
     assert deserialize_json(raw, type(member)) is member
-    with pytest.raises(TypeError, match="Invalid value for"):
-        deserialize_json(parsed, annotation)
+    restored = assert_round_trip(value, annotation)
+    assert member in restored
 
 
 @pytest.mark.parametrize(

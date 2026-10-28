@@ -1040,50 +1040,83 @@ def test_null_is_not_a_numpy_scalar():
         pytest.param(np.bytes_(b"\x00\xff binary"), id="binary"),
     ],
 )
-@pytest.mark.xfail(strict=True, reason="np.bytes_ serializes as Base64 text, but deserializing does not decode it")
 def test_bytes_scalar_round_trips(value):
     assert_round_trip(value, np.bytes_)
 
 
-_LONG_DOUBLE_LOOPS = pytest.mark.xfail(
-    strict=True, reason="item() of a long double is a long double again: 'nested too deeply' after ~200k handler passes"
-)
+def test_bytes_scalar_is_base64_text_both_ways():
+    assert serialize_json(np.bytes_(b"ab")) == '"YWI="'
+    assert_strictly_equal(deserialize_json("YWI=", np.bytes_), np.bytes_(b"ab"))
+    assert_strictly_equal(deserialize_json(["YWI="], list[np.bytes_]), [np.bytes_(b"ab")])
 
 
+@pytest.mark.parametrize("data", [5, None, ["YWI="], {"a": "YWI="}, "abc"])
+def test_bytes_scalar_rejects_what_is_no_base64_text(data):
+    # "abc" is no valid Base64 length
+    with pytest.raises(TypeError):
+        deserialize_json(data, np.bytes_)
+
+
+# NumPy's long double has no Python type: item() of one is the scalar again. It is written as the nearest Python
+# number, a float: a JSON number rounded to double precision (on a platform whose long double is wider than a double,
+# e.g. Linux x86-64; it is a double on macOS arm64 and on Windows). The complex long double has no JSON form, like
+# np.complex128.
 @pytest.mark.parametrize(
     ("make", "number_text"),
     [
-        pytest.param(lambda: np.longdouble(1.5), 1.5, marks=_LONG_DOUBLE_LOOPS, id="longdouble-scalar"),
-        pytest.param(
-            lambda: np.array([1.5], dtype=np.longdouble), [1.5], marks=_LONG_DOUBLE_LOOPS, id="longdouble-array"
-        ),
-        pytest.param(
-            lambda: {"x": [np.longdouble(1.5)]}, {"x": [1.5]}, marks=_LONG_DOUBLE_LOOPS, id="longdouble-nested"
-        ),
+        pytest.param(lambda: np.longdouble(1.5), 1.5, id="longdouble-scalar"),
+        pytest.param(lambda: np.array([1.5], dtype=np.longdouble), [1.5], id="longdouble-array"),
+        pytest.param(lambda: {"x": [np.longdouble(1.5)]}, {"x": [1.5]}, id="longdouble-nested"),
+        pytest.param(lambda: np.longdouble(-2), -2.0, id="longdouble-integer"),
     ],
 )
-def test_long_double_serializes_as_a_number_or_is_rejected_as_unsupported(make, number_text):
-    # Either answer is acceptable (complex and timedelta64 raise TypeError); the endless loop is not.
-    try:
-        text = serialize_json(make())
-    except TypeError:
-        return
-    assert json.loads(text) == number_text
+def test_long_double_serializes_as_a_number(make, number_text):
+    assert json.loads(serialize_json(make())) == number_text
 
 
 @pytest.mark.parametrize(
     "make",
     [
-        pytest.param(lambda: np.clongdouble(1.5), marks=_LONG_DOUBLE_LOOPS, id="clongdouble-scalar"),
-        pytest.param(lambda: np.array([1.5], dtype=np.clongdouble), marks=_LONG_DOUBLE_LOOPS, id="clongdouble-array"),
+        pytest.param(lambda: np.clongdouble(1.5), id="clongdouble-scalar"),
+        pytest.param(lambda: np.array([1.5], dtype=np.clongdouble), id="clongdouble-array"),
+        pytest.param(lambda: {"z": [np.clongdouble(1 + 2j)]}, id="clongdouble-nested"),
     ],
 )
-def test_complex_long_double_serializes_or_is_rejected_as_unsupported(make):
-    try:
-        text = serialize_json(make())
-    except TypeError:
-        return
-    json.loads(text)  # a pair of numbers would do as well: only the endless loop is a defect
+def test_complex_long_double_is_rejected_as_unsupported(make):
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        serialize_json(make())
+
+
+def test_complex_long_double_reaches_the_fallback_as_a_python_complex():
+    assert serialize_json(np.clongdouble(1 + 2j), fallback=lambda value: [value.real, value.imag]) == "[1.0, 2.0]"
+
+
+@pytest.mark.parametrize(
+    ("value", "annotation"),
+    [
+        pytest.param(np.longdouble(1.5), np.longdouble, id="scalar"),
+        pytest.param([np.longdouble(0.25), np.longdouble(-3)], list[np.longdouble], id="list"),
+        pytest.param(np.array([1.5, 2.5], dtype=np.longdouble), np.ndarray, id="array-as-float64"),
+    ],
+)
+def test_long_double_of_a_value_a_double_holds_round_trips(value, annotation):
+    text = serialize_json(value)
+    restored = deserialize_json(json.loads(text), annotation)
+
+    if annotation is np.ndarray:
+        assert restored.dtype == np.float64 and restored.tolist() == value.tolist()  # the dtype is not in the JSON
+    else:
+        assert_strictly_equal(restored, value)
+
+
+@pytest.mark.skipif(np.finfo(np.longdouble).bits <= 64, reason="long double is a double on this platform")
+def test_long_double_precision_beyond_a_double_is_lost_limitation():
+    # Documents current behavior, not a promise: the number written is the double nearest to the long double
+    value = np.longdouble(1) + np.finfo(np.longdouble).eps
+    assert value != 1
+
+    assert json.loads(serialize_json(value)) == 1.0
+    assert deserialize_json(json.loads(serialize_json(value)), np.longdouble) != value
 
 
 # --- scalars as dataclass fields and inside containers ----------------------------------------------------------------

@@ -4,8 +4,8 @@ import json
 import sys
 import typing
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Generator, Mapping
 from collections import Counter
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields, is_dataclass
@@ -823,7 +823,6 @@ class DecimalJsonSerializingHandler(JsonSerializingHandler[Decimal]):
         return _convert(data, cls, cls)
 
 
-# Handler for Enum objects
 def _is_json_of(value: Any, data: JSON) -> bool:
     """Whether the parsed JSON `data` is what `value` is written as: a tuple is an array, at any depth."""
     if isinstance(value, tuple):
@@ -831,6 +830,7 @@ def _is_json_of(value: Any, data: JSON) -> bool:
     return value == data
 
 
+# Handler for Enum objects
 class EnumJsonSerializingHandler(JsonSerializingHandler):
 
     @staticmethod

@@ -49,11 +49,6 @@ from objects_support import assert_round_trip, assert_strictly_equal, to_json_va
 
 # Each mark names the exception its defect makes the test end with (``raises``), so that a mistake in a test, which
 # fails differently, is reported as a failure instead of being absorbed as an expected one.
-UNION_PRIMITIVE_MEMBER_DEFECT = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="a JSON object is returned as a plain dict by a primitive member (int, str) listed before the dataclass",
-)
 TYPING_WRAPPER_DEFECT = pytest.mark.xfail(
     strict=True,
     raises=TypeError,
@@ -3132,9 +3127,9 @@ def test_discriminated_union_rejects_data_that_matches_no_member(data):
 @pytest.mark.parametrize(
     "cls",
     [
-        pytest.param(Union[int, Address], marks=UNION_PRIMITIVE_MEMBER_DEFECT, id="int-first"),
-        pytest.param(Union[str, Address], marks=UNION_PRIMITIVE_MEMBER_DEFECT, id="str-first"),
-        pytest.param(Union[float, Address], marks=UNION_PRIMITIVE_MEMBER_DEFECT, id="float-first"),
+        pytest.param(Union[int, Address], id="int-first"),
+        pytest.param(Union[str, Address], id="str-first"),
+        pytest.param(Union[float, Address], id="float-first"),
         pytest.param(Union[Address, int], id="dataclass-first"),
         pytest.param(Union[None, Address], id="none-first"),
     ],

@@ -988,23 +988,50 @@ def test_str_value_that_looks_like_the_first_member_is_converted_limitation(
     assert_strictly_equal(round_trip_as(value, annotation), claimed_by_first_member)
 
 
-# A primitive annotation (str, int, ...) hands a JSON object through unvalidated, so a primitive member in front of a
-# dataclass or a typed dict claims every object: "id or embedded object" unions only work with the object first.
+# A primitive annotation (str, int, ...) refuses a JSON object, so a primitive member in front of a dataclass or a dict
+# does not claim the objects: "id or embedded object" unions work with either order.
 @pytest.mark.parametrize(
-    ("annotation", "data"),
+    ("annotation", "data", "expected"),
     [
-        pytest.param(Union[str, Point], {"x": 1, "y": 2}, id="str|dataclass"),
-        pytest.param(Union[int, Point], {"x": 1, "y": 2}, id="int|dataclass"),
-        pytest.param(Union[float, Point], {"x": 1, "y": 2}, id="float|dataclass"),
-        pytest.param(Union[str, dict[str, tuple[int, int]]], {"a": [1, 2]}, id="str|dict-of-tuples"),
+        pytest.param(Union[str, Point], {"x": 1, "y": 2}, Point(1, 2), id="str|dataclass"),
+        pytest.param(Union[int, Point], {"x": 1, "y": 2}, Point(1, 2), id="int|dataclass"),
+        pytest.param(Union[float, Point], {"x": 1, "y": 2}, Point(1, 2), id="float|dataclass"),
+        pytest.param(Union[bool, Point], {"x": 1, "y": 2}, Point(1, 2), id="bool|dataclass"),
+        pytest.param(Optional[Point], {"x": 1, "y": 2}, Point(1, 2), id="optional-dataclass"),
+        pytest.param(Union[str, dict[str, tuple[int, int]]], {"a": [1, 2]}, {"a": (1, 2)}, id="str|dict-of-tuples"),
     ],
 )
-def test_primitive_member_before_an_object_member_claims_the_object_limitation(annotation, data):
-    # Documents current behavior, not a promise: the raw JSON object comes back (as an independent copy), unconverted.
+def test_primitive_member_before_an_object_member_does_not_claim_the_object(annotation, data, expected):
     restored = deserialize_json(data, annotation)
 
-    assert_strictly_equal(restored, data)
+    assert_strictly_equal(restored, expected)
     assert_no_shared_containers(restored, data)
+
+
+@pytest.mark.parametrize("annotation", [str, int, float, bool, Optional[str], Union[int, float]])
+def test_primitive_annotation_refuses_a_json_object(annotation):
+    with pytest.raises(TypeError, match="got dict") as caught:
+        deserialize_json({"LEAK": "LEAK"}, annotation)
+
+    assert "LEAK" not in str(caught.value)
+
+
+def test_object_and_any_annotations_still_hand_an_object_through_as_an_independent_copy():
+    data = {"a": [1, {"b": 2}]}
+
+    for annotation in (Any, object, dict):
+        restored = deserialize_json(data, annotation)
+
+        assert restored == data
+        assert_no_shared_containers(restored, data)
+
+
+def test_primitive_annotation_still_takes_a_scalar_of_another_kind_limitation():
+    # Documents current behavior, not a promise: only a JSON object is refused for a primitive annotation. A scalar is
+    # handed through unvalidated, which is also why a primitive member in front of an Enum claims its text.
+    assert deserialize_json("x", int) == "x"
+    assert deserialize_json(5, str) == 5
+    assert deserialize_json("red", Union[int, Color]) == "red"
 
 
 @pytest.mark.parametrize(

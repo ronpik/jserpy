@@ -18,7 +18,7 @@ from typing import Any, TypeVar, Generic, cast, Type, get_origin, get_args, Sequ
 from enum import Enum
 from pathlib import Path, PurePath
 
-from typing_inspect import is_optional_type, is_generic_type, get_origin
+from typing_inspect import is_optional_type, get_origin
 
 from jserpy.json_handler_utils import Dataclass, is_primitive
 from jserpy.json_typing import JSON
@@ -1211,14 +1211,16 @@ def _enter_deserialization(data: JSON, cls: Any, stack: list[_DeserializeSteps])
         # a bare dict or typing.Dict is passed through as is: copied below
 
     if isinstance(data, dict):
-        if not is_generic_type(cls):
-            if issubclass(cls, Jsonable):
-                return JsonableSerializingHandler.deserialize(data, cls)
+        if isinstance(cls, TypeVar):
+            # a type parameter that no type argument replaced (e.g. the T of a plain `Box`): only a scalar passes
+            raise TypeError(f"Unsupported type for deserialization: {cls}")
+        if isinstance(cls, type) and issubclass(cls, (str, int, float)):
+            # a JSON object is no text or number (bool is an int): raise TypeError so that a union moves on to a
+            # member that takes objects, such as a dataclass. A scalar of the wrong kind is not checked (see below).
+            raise TypeError(f"Expected a JSON scalar for {cls}, got {type(data).__name__}")
 
-            if is_dataclass(cls):
-                return _push_deserialize_steps(DataclassJsonSerializingHandler.deserialize_steps(data, cls), stack)
-
-        # passed through as is (e.g. an unparameterized `dict`): copy, so that the result does not alias the input
+        # passed through as is (Any, object, a class without handler, ...): copy, so that the result does not alias the
+        # input
         return _copy_json(data)
 
     if is_json_primitive(data):

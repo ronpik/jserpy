@@ -299,6 +299,15 @@ class Box(Generic[T]):
     items: list[T]
 
 
+K = TypeVar("K")
+V = TypeVar("V")
+
+
+@dataclass(frozen=True)
+class Outer(Generic[T]):
+    box: Box[T]
+
+
 @dataclass(frozen=True)
 class HoldsBox:
     box: Box[Point]
@@ -2297,11 +2306,6 @@ def test_type_variable_fields_refuse_structured_json_limitation(data):
         deserialize_json(data, Box)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=TypeError,
-    reason="a parameterized generic dataclass (Box[int]) is rejected: dataclasses.fields() does not take the alias",
-)
 @pytest.mark.parametrize(
     ("annotation", "data", "expected"),
     [
@@ -2319,19 +2323,115 @@ def test_parameterized_generic_dataclass_can_be_deserialized(annotation, data, e
 
 
 @pytest.mark.parametrize(
-    ("annotation", "data"),
+    ("annotation", "data", "expected"),
     [
-        pytest.param(Box[Point], {"item": {"x": 1, "y": 2}, "items": [{"x": 3, "y": 4}]}, id="Box[Point]"),
-        pytest.param(Optional[Box[Color]], {"item": "red", "items": ["blue"]}, id="Optional[Box[Color]]"),
-        pytest.param(HoldsBox, {"box": {"item": {"x": 1, "y": 2}, "items": []}}, id="field-Box[Point]"),
+        pytest.param(
+            Box[Point],
+            {"item": {"x": 1, "y": 2}, "items": [{"x": 3, "y": 4}]},
+            Box(Point(1, 2), [Point(3, 4)]),
+            id="Box[Point]",
+        ),
+        pytest.param(
+            Optional[Box[Color]],
+            {"item": "red", "items": ["blue"]},
+            Box(Color.RED, [Color.BLUE]),
+            id="Optional[Box[Color]]",
+        ),
+        pytest.param(
+            HoldsBox,
+            {"box": {"item": {"x": 1, "y": 2}, "items": []}},
+            HoldsBox(Box(Point(1, 2), [])),
+            id="field-Box[Point]",
+        ),
+        pytest.param(
+            Box[datetime.date], {"item": "2026-10-27", "items": ["2026-10-28"]}, Box(DAY, [DAY_AFTER]), id="Box[date]"
+        ),
+        pytest.param(
+            Box[Optional[int]], {"item": None, "items": [None, 1]}, Box(None, [None, 1]), id="Box[Optional[int]]"
+        ),
+        pytest.param(Box[int | None], {"item": 5, "items": []}, Box(5, []), id="Box[int | None]"),
+        pytest.param(
+            Box[Box[Point]],
+            {"item": {"item": {"x": 1, "y": 2}, "items": []}, "items": [{"item": {"x": 3, "y": 4}, "items": []}]},
+            Box(Box(Point(1, 2), []), [Box(Point(3, 4), [])]),
+            id="Box[Box[Point]]",
+        ),
+        pytest.param(
+            Box[list[Point]],
+            {"item": [{"x": 1, "y": 2}], "items": [[]]},
+            Box([Point(1, 2)], [[]]),
+            id="Box[list[Point]]",
+        ),
+        pytest.param(
+            Box[Annotated[Color, "m"]], {"item": "red", "items": []}, Box(Color.RED, []), id="Box[Annotated[Color]]"
+        ),
+        pytest.param(Box[UserId], {"item": 7, "items": [8]}, Box(7, [8]), id="Box[NewType]"),
+        pytest.param(Box[Any], {"item": {"a": [1]}, "items": [{"b": 2}]}, Box({"a": [1]}, [{"b": 2}]), id="Box[Any]"),
+        pytest.param(Box[Annotated[int, []]], {"item": 1, "items": [2]}, Box(1, [2]), id="Box[unhashable-annotated]"),
+        pytest.param(
+            dict[str, Box[Point]],
+            {"k": {"item": {"x": 1, "y": 2}, "items": []}},
+            {"k": Box(Point(1, 2), [])},
+            id="dict[str, Box[Point]]",
+        ),
+        pytest.param(
+            Union[int, Box[Point]],
+            {"item": {"x": 1, "y": 2}, "items": []},
+            Box(Point(1, 2), []),
+            id="Union[int, Box[Point]]",
+        ),
     ],
 )
-def test_type_arguments_of_a_generic_dataclass_are_not_substituted_limitation(annotation, data):
-    # Documents current behavior, not a promise: nothing maps the T of Box[Point] onto the TypeVar fields, so a
-    # Box[Point] cannot be restored (today it is refused already because the parameterized alias is rejected, see the
-    # xfail above). It is refused loudly, never half-restored with raw dicts in place of Points.
-    with pytest.raises(TypeError):
+def test_type_arguments_of_a_generic_dataclass_replace_its_type_variables(annotation, data, expected):
+    assert_strictly_equal(deserialize_json(data, annotation), expected)
+
+
+@pytest.mark.parametrize(
+    ("annotation", "data"),
+    [
+        pytest.param(Box[int], {"item": {"a": SENTINEL}, "items": []}, id="object-for-int"),
+        pytest.param(Box[Point], {"item": SENTINEL, "items": []}, id="scalar-for-dataclass"),
+        pytest.param(Box[Point], {"item": {"x": 1, "y": 2}, "items": [SENTINEL]}, id="scalar-for-dataclass-in-list"),
+        pytest.param(Box[Color], {"item": SENTINEL, "items": []}, id="unknown-enum-value"),
+        pytest.param(Box[Point], [SENTINEL], id="array-for-the-box"),
+        pytest.param(Box[Box[Point]], {"item": {"item": [SENTINEL], "items": []}, "items": []}, id="nested-box"),
+    ],
+)
+def test_substituted_type_arguments_are_checked_and_name_no_data(annotation, data):
+    with pytest.raises(TypeError) as caught:
         deserialize_json(data, annotation)
+
+    assert SENTINEL not in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+@dataclass(frozen=True)
+class Pair(Generic[K, V]):
+    first: K
+    second: dict[str, V]
+    maybe: Optional[V] = None
+    tagged: Annotated[list[K], "keys"] = dataclasses.field(default_factory=list)
+
+
+def test_generic_dataclass_with_several_type_variables_maps_each_argument():
+    value = Pair(DAY, {"a": Point(1, 2)}, Point(3, 4), [DAY_AFTER])
+
+    assert_round_trip(value, Pair[datetime.date, Point])
+    assert_strictly_equal(
+        deserialize_json({"first": "red", "second": {"a": 5}, "maybe": None, "tagged": ["blue"]}, Pair[Color, int]),
+        Pair(Color.RED, {"a": 5}, None, [Color.BLUE]),
+    )
+
+
+def test_generic_dataclass_in_a_generic_dataclass_takes_the_outer_type_argument():
+    value = Outer(Box(DAY, [DAY_AFTER]))
+
+    assert_round_trip(value, Outer[datetime.date])
+
+
+def test_a_type_variable_without_argument_keeps_the_raw_scalar_limitation():
+    # Documents current behavior, not a promise: without a type argument the field is not converted.
+    assert_strictly_equal(deserialize_json({"item": "2026-10-27", "items": []}, Box), Box("2026-10-27", []))
 
 
 # --- forward references and string annotations ------------------------------------------------------------------------

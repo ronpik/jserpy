@@ -49,11 +49,6 @@ from objects_support import assert_round_trip, assert_strictly_equal, to_json_va
 
 # Each mark names the exception its defect makes the test end with (``raises``), so that a mistake in a test, which
 # fails differently, is reported as a failure instead of being absorbed as an expected one.
-GENERIC_DATACLASS_DEFECT = pytest.mark.xfail(
-    strict=True,
-    raises=TypeError,
-    reason="a parameterized generic dataclass (Box[int]) cannot be a target: dataclasses.fields rejects the alias",
-)
 
 
 def assert_text(value, expected):
@@ -1867,16 +1862,17 @@ def test_generic_dataclass_is_written_like_a_plain_one(value, expected):
     assert_text(value, expected)
 
 
-# The cases are limited to what needs no TypeVar substitution (the item stays a JSON primitive), so that they pass as
-# soon as a parameterized alias is accepted as a target at all.
 @pytest.mark.parametrize(
     ("value", "cls"),
     [
-        pytest.param(Box(5, "five"), Box[int], marks=GENERIC_DATACLASS_DEFECT, id="root"),
-        pytest.param([Box("a"), Box("b")], List[Box[str]], marks=GENERIC_DATACLASS_DEFECT, id="list"),
+        pytest.param(Box(5, "five"), Box[int], id="root"),
+        pytest.param([Box("a"), Box("b")], List[Box[str]], id="list"),
+        pytest.param(Shelf(Box(7), [Box("a", "first")], Box(8, "eight")), Shelf, id="field"),
+        pytest.param(Box(datetime.date(2024, 2, 29)), Box[datetime.date], id="date-item"),
         pytest.param(
-            Shelf(Box(7), [Box("a", "first")], Box(8, "eight")), Shelf, marks=GENERIC_DATACLASS_DEFECT, id="field"
+            Crate(Box(datetime.date(2024, 2, 29)), [Box("a"), Box("b", "second")]), Crate, id="date-item-in-a-field"
         ),
+        pytest.param(Box(Box(Decimal("1.50"))), Box[Box[Decimal]], id="nested-decimal"),
     ],
 )
 def test_parameterized_generic_dataclass_round_trip(value, cls):

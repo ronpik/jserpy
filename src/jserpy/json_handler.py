@@ -745,6 +745,59 @@ def _dataclass_field_types(cls: type) -> dict[str, Any]:
     return field_types
 
 
+def _replace_type_variables(annotation: Any, replacements: Mapping[Any, Any]) -> Any:
+    """Return `annotation` with its type variables replaced, e.g. `list[T]` as `list[int]` for `{T: int}`.
+
+    A type variable that has no replacement stays as it is. Only parameterized aliases (`Box[T]`, `list[T]`,
+    `Optional[T]`, `T | None`, `Annotated[T, ...]`) are rebuilt; a generic class used without arguments is not.
+    """
+    if isinstance(annotation, TypeVar):
+        return replacements.get(annotation, annotation)
+
+    parameters = getattr(annotation, "__parameters__", None)
+    if not parameters or typing.get_origin(annotation) is None:
+        return annotation
+    try:
+        return annotation[tuple(replacements.get(parameter, parameter) for parameter in parameters)]
+    except Exception:
+        return annotation
+
+
+def _replaced_field_types(dataclass_cls: type, type_arguments: tuple[Any, ...]) -> dict[str, Any]:
+    field_types = _dataclass_field_types(dataclass_cls)
+    parameters = getattr(dataclass_cls, "__parameters__", ())
+    if not parameters or len(parameters) != len(type_arguments) or not all(map(_is_type_variable, parameters)):
+        # not a plain generic class (or an alias that does not match it, e.g. with a variadic parameter)
+        return field_types
+    replacements = dict(zip(parameters, type_arguments))
+    return {name: _replace_type_variables(annotation, replacements) for name, annotation in field_types.items()}
+
+
+def _is_type_variable(parameter: Any) -> bool:
+    return isinstance(parameter, TypeVar)
+
+
+_cached_replaced_field_types = lru_cache(maxsize=None)(_replaced_field_types)
+
+
+def _parameterized_field_types(cls: Any) -> dict[str, Any]:
+    """The annotation of each field of the dataclass `cls`: a dataclass, or an alias of a generic one (`Box[int]`).
+
+    For the alias, the type arguments take the place of the type variables in the annotations.
+    """
+    dataclass_cls = typing.get_origin(cls)
+    if dataclass_cls is None:
+        return _dataclass_field_types(cls)
+
+    type_arguments = typing.get_args(cls)
+    try:
+        hash(type_arguments)
+    except TypeError:
+        # e.g. the metadata of an Annotated argument is a list: not cacheable
+        return _replaced_field_types(dataclass_cls, type_arguments)
+    return _cached_replaced_field_types(dataclass_cls, type_arguments)
+
+
 # Handler for dataclasses with recursive deserialization
 class DataclassJsonSerializingHandler(JsonSerializingHandler[DC]):
 
@@ -765,9 +818,12 @@ class DataclassJsonSerializingHandler(JsonSerializingHandler[DC]):
             raise TypeError(f"Expected a JSON object for {cls}, got {type(data).__name__}")
         kwargs = {}
         not_init = {}
-        field_types = _dataclass_field_types(cls)
+        # `cls` is also an alias of a generic dataclass such as `Box[int]`: the fields and the constructor are those of
+        # the class itself
+        dataclass_cls = typing.get_origin(cls) or cls
+        field_types = _parameterized_field_types(cls)
         # Iterate through each field of the dataclass
-        for field in fields(cls):
+        for field in fields(dataclass_cls):
             field_name = field.name
             field_type = field_types[field_name]
             try:
@@ -788,7 +844,7 @@ class DataclassJsonSerializingHandler(JsonSerializingHandler[DC]):
             else:
                 not_init[field_name] = deserialized_value
 
-        instance = cls(**kwargs)
+        instance = dataclass_cls(**kwargs)
         for field_name, deserialized_value in not_init.items():
             # `__init__` does not take these; set them like the constructor does (also for frozen and slots classes)
             object.__setattr__(instance, field_name, deserialized_value)

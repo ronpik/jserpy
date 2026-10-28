@@ -60,6 +60,30 @@ _PENDING = object()
 _NATIVE_JSON_TYPES = frozenset((str, int, float, bool, type(None)))
 
 
+def _normalize_annotation(cls: Any) -> Any:
+    """Return the annotation that decides how a value is deserialized, with the wrappers around it removed.
+
+    `None` stands for NoneType (PEP 484), `NewType` for its supertype, `Annotated[X, ...]` and `Final[X]` for X (a bare
+    `Final` says nothing, so it stands for Any). They nest (`Final[Annotated[UserId, ...]]`). Everything else, such as
+    `Optional[UserId]` or `list[UserId]`, is returned as it is: the wrappers inside it are removed when the members of
+    the union or the items of the container are entered.
+    """
+    while not isinstance(cls, type):
+        if cls is None:
+            return type(None)
+        # not isinstance(cls, typing.NewType): typing_extensions has a NewType of its own before Python 3.10
+        supertype = getattr(cls, "__supertype__", None)
+        if supertype is not None:
+            cls = supertype
+        elif typing.get_origin(cls) in (typing.Annotated, typing.Final):
+            cls = typing.get_args(cls)[0]
+        elif cls is typing.Final:
+            return Any
+        else:
+            return cls
+    return cls
+
+
 def _is_jsonable_primitive(value: Any) -> bool:
     """Whether `value` is a `Jsonable` that subclasses str, int or float.
 
@@ -331,6 +355,7 @@ def _reconstruct_key(key: str, cls: Type[T]) -> T:
 
 
 def _deserialize_keys(obj: Any, keys_cls: Type[T]) -> Any:
+    keys_cls = _normalize_annotation(keys_cls)
     if keys_cls is Any:
         # nothing to restore the keys to: they stay the strings of the JSON object
         return obj
@@ -646,7 +671,7 @@ def _resolved_field_types(cls: type) -> dict[str, Any]:
 def _has_forward_reference(annotation: Any) -> bool:
     """Whether `annotation` holds a string or `ForwardRef`, e.g. `Optional["Node"]` or `list["Node"]`.
 
-    The type arguments of `Literal` (values) and `Annotated` (metadata) are not annotations; they are skipped.
+    The type arguments of `Literal` (values) and the metadata of `Annotated` are not annotations; they are skipped.
     Iterative, since annotations can nest as deeply as the data.
     """
     pending = [annotation]
@@ -654,7 +679,11 @@ def _has_forward_reference(annotation: Any) -> bool:
         item = pending.pop()
         if isinstance(item, (str, typing.ForwardRef)):
             return True
-        if typing.get_origin(item) in (typing.Literal, typing.Annotated):
+        origin = typing.get_origin(item)
+        if origin is typing.Literal:
+            continue
+        if origin is typing.Annotated:
+            pending.append(typing.get_args(item)[0])
             continue
         pending.extend(typing.get_args(item))
     return False
@@ -677,8 +706,13 @@ def _resolve_forward_references(annotation: Any, globalns: dict[str, Any], local
         return _resolve_forward_references(evaluated, globalns, localns)
 
     args = typing.get_args(annotation)
-    if not args or typing.get_origin(annotation) in (typing.Literal, typing.Annotated):
+    origin = typing.get_origin(annotation)
+    if not args or origin is typing.Literal:
         return annotation
+    if origin is typing.Annotated:
+        # only the first argument is an annotation, the others are metadata
+        resolved = _resolve_forward_references(args[0], globalns, localns)
+        return annotation if resolved is args[0] else typing.Annotated[(resolved, *args[1:])]
     resolved_args = tuple(_resolve_forward_references(arg, globalns, localns) for arg in args)
     if all(resolved is arg for resolved, arg in zip(resolved_args, args)):
         return annotation
@@ -1169,9 +1203,7 @@ def _run_deserialize_steps_stack(stack: list[_DeserializeSteps]) -> Any:
 
 def _enter_deserialization(data: JSON, cls: Any, stack: list[_DeserializeSteps]) -> Any:
     """Return `data` deserialized as `cls`, or `_PENDING` after pushing the steps of a container onto `stack`."""
-    if cls is None:
-        # PEP 484: None in an annotation stands for NoneType
-        cls = type(None)
+    cls = _normalize_annotation(cls)
 
     if cls is Any:
         return _copy_json(data)

@@ -49,11 +49,6 @@ from objects_support import assert_round_trip, assert_strictly_equal, to_json_va
 
 # Each mark names the exception its defect makes the test end with (``raises``), so that a mistake in a test, which
 # fails differently, is reported as a failure instead of being absorbed as an expected one.
-TYPING_WRAPPER_DEFECT = pytest.mark.xfail(
-    strict=True,
-    raises=TypeError,
-    reason="a NewType or Annotated annotation is not understood: dispatch raises TypeError instead of unwrapping it",
-)
 GENERIC_DATACLASS_DEFECT = pytest.mark.xfail(
     strict=True,
     raises=TypeError,
@@ -1937,9 +1932,9 @@ def test_wrapped_and_abstract_annotations_are_written_from_the_value(value, text
 @pytest.mark.parametrize(
     ("value", "cls"),
     [
-        pytest.param(Account(UserId(5), "x"), Account, marks=TYPING_WRAPPER_DEFECT, id="new-type"),
-        pytest.param(OptionalAccount(UserId(5)), OptionalAccount, marks=TYPING_WRAPPER_DEFECT, id="optional-new-type"),
-        pytest.param(Measured([1, 2]), Measured, marks=TYPING_WRAPPER_DEFECT, id="annotated"),
+        pytest.param(Account(UserId(5), "x"), Account, id="new-type"),
+        pytest.param(OptionalAccount(UserId(5)), OptionalAccount, id="optional-new-type"),
+        pytest.param(Measured([1, 2]), Measured, id="annotated"),
         pytest.param(OptionalAccount(), OptionalAccount, id="optional-new-type-null"),
     ],
 )
@@ -2074,6 +2069,13 @@ class BinNode:
 
 
 @dataclass
+class AnnotatedNode:
+    value: int
+    children: list[Annotated[Optional["AnnotatedNode"], "child"]] = field(default_factory=list)
+    next: Annotated[Optional["AnnotatedNode"], "link"] = None
+
+
+@dataclass
 class Alpha:
     n: int
     beta: Optional["Beta"] = None
@@ -2107,6 +2109,14 @@ class Author:
 class Book:
     title: str
     author: Optional[Author] = None
+
+
+def test_quoted_class_name_inside_annotated_is_resolved():
+    node = AnnotatedNode(1, [AnnotatedNode(2), None], AnnotatedNode(3, next=AnnotatedNode(4)))
+
+    restored = assert_round_trip(node, AnnotatedNode)
+
+    assert type(restored.children[0]) is AnnotatedNode and type(restored.next.next) is AnnotatedNode
 
 
 def linked_list(length):

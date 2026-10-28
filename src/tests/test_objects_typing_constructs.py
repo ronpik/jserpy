@@ -2099,17 +2099,12 @@ def test_typed_dict_values_are_handed_through_unconverted_limitation():
 
 # --- NewType, Annotated, Final, ClassVar, TypeVar, Generic ------------------------------------------------------------
 
-_NEW_TYPE_REASON = "NewType is not unwrapped to its supertype (TypeError: issubclass() arg 1 must be a class)"
-_NEW_TYPE_XFAIL = pytest.mark.xfail(strict=True, raises=TypeError, reason=_NEW_TYPE_REASON)
-
-
 def test_new_type_values_serialize_as_their_supertype():
     account = Account(UserId(7), Slug("ann"), [UserId(1), UserId(2)], None)
 
     assert serialize_json(account) == '{"uid": 7, "slug": "ann", "friends": [1, 2], "boss": null}'
 
 
-@_NEW_TYPE_XFAIL
 @pytest.mark.parametrize(
     ("annotation", "data", "expected"),
     [
@@ -2124,7 +2119,6 @@ def test_new_type_target_behaves_like_its_supertype(annotation, data, expected):
     assert_strictly_equal(deserialize_json(data, annotation), expected)
 
 
-@_NEW_TYPE_XFAIL
 def test_new_type_dataclass_fields_round_trip():
     account = Account(UserId(7), Slug("ann"), [UserId(1), UserId(2)], UserId(3))
 
@@ -2154,17 +2148,6 @@ def test_annotated_optional_field_accepts_null():
     assert_round_trip(value, Measured)
 
 
-# Python 3.14 raises TypeError (issubclass() arg 1 must be a class); on 3.10, where Annotated is a plain class, the JSON
-# value is passed through unconverted, which the strict comparison reports. Only cases that fail on both are listed:
-# Annotated[int, ...] "works" on 3.10 because primitives are never validated.
-_ANNOTATED_XFAIL = pytest.mark.xfail(
-    strict=True,
-    raises=(TypeError, AssertionError),
-    reason="Annotated[X, ...] is not unwrapped to X outside string annotations",
-)
-
-
-@_ANNOTATED_XFAIL
 @pytest.mark.parametrize(
     ("annotation", "data", "expected"),
     [
@@ -2183,7 +2166,6 @@ def test_annotated_field_with_a_real_annotation_serializes_as_its_wrapped_type()
     assert serialize_json(RealMeasured(count=1, when=DAY)) == '{"count": 1, "when": "2026-10-27"}'
 
 
-@_ANNOTATED_XFAIL
 def test_annotated_field_with_a_real_annotation_round_trips():
     assert_round_trip(RealMeasured(count=1, when=DAY), RealMeasured)
 
@@ -2202,13 +2184,81 @@ def test_final_field_serializes_as_its_value():
     assert serialize_json(WithFinal("x")) == '{"name": "x", "limit": 10}'
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=TypeError,
-    reason="Final[X] is not unwrapped to X (TypeError: issubclass() arg 1 must be a class)",
-)
 def test_final_field_round_trips():
     assert_round_trip(WithFinal("x", 12), WithFinal)
+
+
+AdminId = NewType("AdminId", UserId)
+Day = NewType("Day", datetime.date)
+ColorOf = NewType("ColorOf", Color)
+Spot = NewType("Spot", Point)
+KeyName = NewType("KeyName", str)
+
+
+@pytest.mark.parametrize(
+    ("annotation", "data", "expected"),
+    [
+        pytest.param(AdminId, 7, 7, id="new-type-of-new-type"),
+        pytest.param(Day, "2026-10-27", DAY, id="new-type-of-date"),
+        pytest.param(ColorOf, "red", Color.RED, id="new-type-of-enum"),
+        pytest.param(Spot, {"x": 1, "y": 2}, Point(1, 2), id="new-type-of-dataclass"),
+        pytest.param(Optional[Spot], {"x": 1, "y": 2}, Point(1, 2), id="optional-new-type-of-dataclass"),
+        pytest.param(Union[Spot, int], 5, 5, id="union-with-new-type-member"),
+        pytest.param(Final[UserId], 7, 7, id="final-new-type"),
+        pytest.param(Final[list[int]], [1, 2], [1, 2], id="final-list"),
+        pytest.param(Final[Annotated[Color, "m"]], "red", Color.RED, id="final-annotated"),
+        pytest.param(Annotated[Annotated[Color, "a"], "b"], "red", Color.RED, id="annotated-twice"),
+        pytest.param(Annotated[Final[Color], "m"], "red", Color.RED, id="annotated-final"),
+        pytest.param(Annotated[Union[Color, int], "m"], "red", Color.RED, id="annotated-union"),
+        pytest.param(Annotated[Optional[Point], "m"], None, None, id="annotated-optional-null"),
+        pytest.param(Annotated[Spot, "m"], {"x": 1, "y": 2}, Point(1, 2), id="annotated-new-type"),
+        pytest.param(dict[str, Annotated[Point, "m"]], {"a": {"x": 1, "y": 2}}, {"a": Point(1, 2)}, id="dict-value"),
+        pytest.param(tuple[UserId, Annotated[Color, "m"]], [1, "red"], (1, Color.RED), id="tuple-items"),
+        pytest.param(set[Annotated[Color, "m"]], ["red"], {Color.RED}, id="set-items"),
+        pytest.param(Final, {"a": [1]}, {"a": [1]}, id="bare-final-is-any"),
+    ],
+)
+def test_wrappers_are_removed_at_any_depth_of_an_annotation(annotation, data, expected):
+    assert_strictly_equal(deserialize_json(data, annotation), expected)
+
+
+@pytest.mark.parametrize(
+    ("annotation", "data", "expected"),
+    [
+        pytest.param(dict[KeyName, int], {"a": 1}, {"a": 1}, id="new-type-of-str"),
+        pytest.param(dict[ColorOf, int], {"red": 1}, {Color.RED: 1}, id="new-type-of-enum"),
+        pytest.param(dict[Annotated[Color, "m"], int], {"red": 1}, {Color.RED: 1}, id="annotated-enum"),
+        pytest.param(dict[Annotated[str, "m"], int], {"a": 1}, {"a": 1}, id="annotated-str"),
+        pytest.param(
+            dict[Annotated[tuple[int, str], "m"], int], {'[1, "a"]': 1}, {(1, "a"): 1}, id="annotated-tuple"
+        ),
+        pytest.param(Mapping[Annotated[Color, "m"], int], {"red": 1}, {Color.RED: 1}, id="mapping-annotated-enum"),
+        pytest.param(dict[Final[KeyName], int], {"a": 1}, {"a": 1}, id="final-new-type"),
+    ],
+)
+def test_mapping_key_annotations_are_unwrapped(annotation, data, expected):
+    assert_strictly_equal(deserialize_json(data, annotation), expected)
+
+
+@pytest.mark.parametrize(
+    ("annotation", "data"),
+    [
+        pytest.param(Annotated[list[int], "m"], {"k": SENTINEL}, id="annotated-list-given-an-object"),
+        pytest.param(Annotated[Point, "m"], [SENTINEL], id="annotated-dataclass-given-an-array"),
+        pytest.param(Spot, [SENTINEL], id="new-type-dataclass-given-an-array"),
+        pytest.param(ColorOf, SENTINEL, id="new-type-enum-given-another-text"),
+        pytest.param(Final[dict[str, int]], SENTINEL, id="final-dict-given-a-scalar"),
+        pytest.param(AdminId, {"k": SENTINEL}, id="new-type-int-given-an-object"),
+        pytest.param(Optional[Spot], [SENTINEL], id="optional-new-type-given-an-array"),
+        pytest.param(dict[Annotated[Color, "m"], int], {SENTINEL: 1}, id="annotated-key-not-a-member"),
+    ],
+)
+def test_unwrapped_annotations_keep_their_checks_and_name_no_data(annotation, data):
+    with pytest.raises(TypeError) as caught:
+        deserialize_json(data, annotation)
+
+    assert SENTINEL not in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 @pytest.mark.parametrize(

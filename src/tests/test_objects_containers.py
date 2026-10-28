@@ -17,7 +17,7 @@ import functools
 import json
 import math
 import typing
-from collections import ChainMap, Counter, OrderedDict, UserDict, defaultdict
+from collections import ChainMap, Counter, OrderedDict, UserDict, defaultdict, namedtuple
 from collections.abc import Mapping
 from dataclasses import dataclass, make_dataclass
 from datetime import date, datetime
@@ -139,6 +139,28 @@ class Stamp(NamedTuple):
     tags: frozenset[str]
 
 
+class Sub(Vec):
+    """A subclass of a NamedTuple that adds nothing to its fields."""
+
+    __slots__ = ()
+
+
+class Line(NamedTuple):
+    start: Vec
+    end: "Vec"
+    via: Optional[Vec]
+
+
+class Plain(namedtuple("Plain", ["first", "second"])):
+    """A namedtuple without field annotations."""
+
+    __slots__ = ()
+
+
+class Coords(tuple):
+    pass
+
+
 class Playlist(list):
     pass
 
@@ -184,10 +206,6 @@ class LeakyKey:
         return "KEY_SENTINEL"
 
     __str__ = __repr__
-
-
-def _xfail(reason):
-    return pytest.mark.xfail(strict=True, reason=reason)
 
 
 def _canonical(json_value):
@@ -312,7 +330,7 @@ def test_dataclass_with_list_fields_has_declaration_order_and_round_trips():
     ("data", "annotation", "message"),
     [
         pytest.param(["LEAK", "LEAK"], list[list[int]], "Expected a JSON array", id="strings-for-lists"),
-        pytest.param([["LEAK"]], list[dict[str, int]], "Unsupported type for deserialization", id="list-for-dict"),
+        pytest.param([["LEAK"]], list[dict[str, int]], "Expected a JSON object", id="list-for-dict"),
         pytest.param({"a": ["LEAK"]}, list[list[int]], "Expected a JSON array", id="object-for-list"),
         pytest.param(
             [["LEAK"], {"LEAK": "LEAK"}], list[list[str]], "Expected a JSON array", id="object-among-lists"
@@ -430,10 +448,23 @@ def test_fixed_tuple_with_a_wrongly_shaped_member_raises_type_error():
         deserialize_json(["x", 1], tuple[list[int], int])
 
 
-@pytest.mark.xfail(strict=True, reason="tuple[()] (an empty tuple) accepts any array: [1] restores as (1,)")
 def test_empty_tuple_annotation_rejects_a_non_empty_array():
     with pytest.raises(TypeError):
         deserialize_json([1], tuple[()])
+
+
+@pytest.mark.parametrize("annotation", [tuple[()], typing.Tuple[()]], ids=["tuple", "typing-Tuple"])
+def test_empty_tuple_annotation_is_a_fixed_length_of_zero(annotation):
+    # unlike the bare tuple, which takes any array; get_args() of both is () from Python 3.11
+    assert_strictly_equal(deserialize_json([], annotation), ())
+    for data in ([1], [None], ["x", 2]):
+        with pytest.raises(TypeError, match="length 0"):
+            deserialize_json(data, annotation)
+
+    assert_strictly_equal(deserialize_json([1, 2], tuple), (1, 2))
+    assert_strictly_equal(deserialize_json([1, 2], typing.Tuple), (1, 2))
+    assert_strictly_equal(deserialize_json([], Union[tuple[()], list[int]]), ())
+    assert_strictly_equal(deserialize_json([1], Union[tuple[()], list[int]]), [1])
 
 
 def test_bare_tuple_annotation_returns_inner_lists_limitation():
@@ -451,19 +482,86 @@ def test_named_tuple_restores_its_values_positionally():
     assert tuple(restored) == (1, 2)
 
 
-_NAMED_TUPLE_DEFECT = _xfail("a NamedTuple target restores a plain tuple (and ignores the field types)")
-
 NAMED_TUPLE_TARGETS = [
-    pytest.param(Vec(1, 2), Vec, id="root", marks=_NAMED_TUPLE_DEFECT),
-    pytest.param([Vec(1, 2), Vec(3, 4)], list[Vec], id="list-of-named-tuples", marks=_NAMED_TUPLE_DEFECT),
-    pytest.param({"a": Vec(0, 0)}, dict[str, Vec], id="dict-value", marks=_NAMED_TUPLE_DEFECT),
-    pytest.param(Stamp(date(2024, 5, 17), frozenset({"a"})), Stamp, id="field-types", marks=_NAMED_TUPLE_DEFECT),
+    pytest.param(Vec(1, 2), Vec, id="root"),
+    pytest.param([Vec(1, 2), Vec(3, 4)], list[Vec], id="list-of-named-tuples"),
+    pytest.param({"a": Vec(0, 0)}, dict[str, Vec], id="dict-value"),
+    pytest.param(Stamp(date(2024, 5, 17), frozenset({"a"})), Stamp, id="field-types"),
+    pytest.param(Sub(1, 2), Sub, id="subclass-of-a-named-tuple"),
+    pytest.param(Line(Vec(0, 0), Vec(3, 4), None), Line, id="nested-named-tuples-with-null"),
+    pytest.param(Line(Vec(0, 0), Vec(3, 4), Vec(1, 1)), Line, id="nested-named-tuples-with-optional-item"),
+    pytest.param(Line(Vec(0, 0), Vec(3, 4), None), Optional[Line], id="optional-named-tuple"),
+    pytest.param(Plain(1, "a"), Plain, id="collections-namedtuple"),
 ]
 
 
 @pytest.mark.parametrize(("value", "annotation"), NAMED_TUPLE_TARGETS)
 def test_named_tuple_target_restores_the_named_tuple(value, annotation):
-    assert_round_trip(value, annotation)
+    restored = assert_round_trip(value, annotation)
+
+    assert type(restored) is type(value)
+
+
+def test_named_tuple_is_written_as_a_plain_array_of_its_fields():
+    assert serialize_json(Stamp(date(2024, 5, 17), frozenset({"a"}))) == '["2024-05-17", ["a"]]'
+    assert serialize_json(Line(Vec(0, 0), Vec(3, 4), None)) == "[[0, 0], [3, 4], null]"
+
+
+def test_named_tuple_fields_are_converted_to_their_annotations():
+    restored = deserialize_json(["2024-05-17", ["a", "b"]], Stamp)
+
+    assert_strictly_equal(restored, Stamp(date(2024, 5, 17), frozenset({"a", "b"})))
+    assert restored.day == date(2024, 5, 17) and restored._fields == ("day", "tags")
+
+
+def test_collections_namedtuple_keeps_its_class_and_hands_the_items_through():
+    restored = deserialize_json([[1, 2], "a"], Plain)
+
+    assert_strictly_equal(restored, Plain([1, 2], "a"))
+    assert type(restored) is Plain
+
+
+@pytest.mark.parametrize(
+    ("data", "annotation", "message"),
+    [
+        pytest.param([1], Vec, "length 2", id="too-short"),
+        pytest.param([1, 2, 3], Vec, "length 2", id="too-long"),
+        pytest.param([], Vec, "length 2", id="empty"),
+        pytest.param("LEAK", Vec, "Expected a JSON array", id="string"),
+        pytest.param({"x": "LEAK", "y": 2}, Vec, "Expected a JSON array", id="object"),
+        pytest.param(None, Vec, "Expected a JSON array", id="null"),
+        pytest.param(["LEAK", "2024-05-17"], Stamp, "Invalid value", id="bad-item"),
+        pytest.param([[["LEAK"]], None, None], Line, "Expected a JSON array", id="bad-nested-named-tuple"),
+        pytest.param([["LEAK"], "a"], Stamp, "Invalid value", id="array-for-a-date"),
+    ],
+)
+def test_named_tuple_target_refuses_what_does_not_fit_without_naming_the_data(data, annotation, message):
+    with pytest.raises(TypeError, match=message) as caught:
+        deserialize_json(data, annotation)
+
+    assert "LEAK" not in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+def test_named_tuple_member_of_a_union_is_selected_by_its_shape():
+    assert_strictly_equal(deserialize_json([1, 2], Union[Vec, str]), Vec(1, 2))
+    assert_strictly_equal(deserialize_json("v", Union[Vec, str]), "v")
+    assert_strictly_equal(deserialize_json([1, 2, 3], Union[Vec, list[int]]), [1, 2, 3])
+
+
+def test_named_tuple_as_a_mapping_key_comes_back_as_the_named_tuple():
+    value = {Vec(1, 2): "a", Vec(3, 4): "b"}
+
+    restored = assert_round_trip(value, dict[Vec, str])
+
+    assert all(type(key) is Vec for key in restored)
+
+
+def test_tuple_subclass_without_fields_stays_a_plain_tuple_limitation():
+    # Documents current behavior, not a promise: only a NamedTuple has fields to build the class from; any other tuple
+    # subclass is handled like a bare `tuple`, so the result is a plain tuple.
+    assert_strictly_equal(deserialize_json([1, 2], Coords), (1, 2))
+    assert_strictly_equal(deserialize_json([1, 2], tuple[int, int]), (1, 2))
 
 
 # --- sets and frozensets -----------------------------------------------------------------------------------------
@@ -934,10 +1032,8 @@ def test_mapping_subclass_targets_restore_a_plain_dict_limitation(value, annotat
         pytest.param(Optional[Counter[str]], id="optional-Counter"),
     ],
 )
-@_xfail("Counter[str] has one type argument and raises ValueError (not enough values to unpack), even inside a union")
 def test_counter_with_a_single_type_argument_is_restored(annotation):
-    # Bare `Counter` restores {"a": 1} (see above), and Counter[str] is its natural annotation; the ValueError is not
-    # the TypeError that the union fall-through and the documented contract use.
+    # Bare `Counter` restores {"a": 1} (see above), and Counter[str] is its natural annotation
     restored = deserialize_json({"a": 1}, annotation)
 
     assert restored == {"a": 1}
@@ -1499,17 +1595,24 @@ def test_enum_keys_with_non_string_values_serialize_as_their_value_text():
         pytest.param(Switch.ON, Switch, id="bool-valued"),
         pytest.param(Ratio.HALF, Ratio, id="float-valued"),
         pytest.param(Blank.NOTHING, Blank, id="null-valued"),
+        pytest.param(Cell.ORIGIN, Cell, id="tuple-valued"),
     ],
 )
-def test_enum_keys_with_non_string_values_cannot_be_restored_limitation(member, enum_type):
-    # Documents current behavior, not a promise: the README lists Enum keys as supported, but a key is restored by
-    # calling the enum with the JSON key text ("1"), which only matches a str-valued member. The same member is
-    # restored fine as a dict value, so the loss is specific to keys (the control below). It is a TypeError that
-    # names the enum and the JSON type only.
-    assert_round_trip([member], list[enum_type])
+def test_enum_keys_with_non_string_values_are_restored_as_members(member, enum_type):
+    # a key is the text of the member value ("1", "true", "0.5", "null", "[0, 0]"): the member with that key text is
+    # restored, not the member whose value equals the text
+    restored = assert_round_trip({member: 1}, dict[enum_type, int])
 
-    with pytest.raises(TypeError, match="Invalid value for .*, got str"):
-        deserialize_json(to_json_value({member: 1}), dict[enum_type, int])
+    assert next(iter(restored)) is member
+
+
+def test_enum_key_that_is_no_members_text_is_a_type_error_naming_the_enum_only():
+    with pytest.raises(TypeError, match="Invalid value for .*, got str") as caught:
+        deserialize_json({"KEY_SENTINEL": 1}, dict[Level, int])
+
+    assert "KEY_SENTINEL" not in str(caught.value)
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+    assert deserialize_json({"KEY_SENTINEL": 1}, Union[dict[Level, int], dict[str, int]]) == {"KEY_SENTINEL": 1}
 
 
 def test_enum_keys_with_str_values_are_restored_from_their_text():
@@ -1558,14 +1661,13 @@ def test_bare_tuple_key_with_a_nested_tuple_cannot_be_restored_limitation():
 @pytest.mark.parametrize(
     ("key", "error", "message"),
     [
-        pytest.param("KEY_SENTINEL", ValueError, "Expecting value", id="not-json"),
+        pytest.param("KEY_SENTINEL", TypeError, "not JSON", id="not-json"),
         pytest.param("5", TypeError, "Expected a JSON array", id="json-number"),
         pytest.param('{"KEY_SENTINEL": 1}', TypeError, "Expected a JSON array", id="json-object"),
     ],
 )
-def test_tuple_key_that_is_not_a_json_array_is_refused_without_the_key_limitation(key, error, message):
-    # Documents current behavior, not a promise: only a key that is a JSON array can be a tuple. A key that is not
-    # JSON at all escapes as the json module's own error (a ValueError, so a Union would not try its next member).
+def test_tuple_key_that_is_not_a_json_array_is_refused_without_the_key(key, error, message):
+    # only a key that is a JSON array can be a tuple; one that is not JSON at all is a TypeError too
     with pytest.raises(error, match=message) as caught:
         deserialize_json({key: 1}, dict[tuple, int])
 
@@ -1611,16 +1713,13 @@ def test_key_annotations_that_are_not_classes_are_unsupported_limitation(annotat
         deserialize_json({"a": 1}, annotation)
 
 
-_NONE_ARGUMENT_DEFECT = _xfail("None as a type argument of a builtin generic raises TypeError (issubclass() arg 1)")
-
-
 @pytest.mark.parametrize(
     ("data", "annotation", "expected"),
     [
-        pytest.param([None, None], list[None], [None, None], id="list", marks=_NONE_ARGUMENT_DEFECT),
-        pytest.param([1, None], tuple[int, None], (1, None), id="tuple", marks=_NONE_ARGUMENT_DEFECT),
-        pytest.param({"a": None}, dict[str, None], {"a": None}, id="dict", marks=_NONE_ARGUMENT_DEFECT),
-        pytest.param([None], set[None], {None}, id="set", marks=_NONE_ARGUMENT_DEFECT),
+        pytest.param([None, None], list[None], [None, None], id="list"),
+        pytest.param([1, None], tuple[int, None], (1, None), id="tuple"),
+        pytest.param({"a": None}, dict[str, None], {"a": None}, id="dict"),
+        pytest.param([None], set[None], {None}, id="set"),
     ],
 )
 def test_none_as_a_type_argument_of_a_builtin_generic(data, annotation, expected):

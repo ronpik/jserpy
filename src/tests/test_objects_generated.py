@@ -1030,21 +1030,14 @@ WRONG_JSON = (
 
 
 def corrupted_documents(seed: int, count: int = 6) -> list:
-    """The JSON of the seed's value with one node replaced by a value of another shape, ``count`` times.
-
-    An annotation with a tuple-keyed dict is not offered an object with keys that are not JSON text: restoring one is
-    a ``json.JSONDecodeError``, not a TypeError (see ``test_tuple_dict_key_that_is_not_json_text_is_a_type_error``).
-    """
+    """The JSON of the seed's value with one node replaced by a value of another shape, ``count`` times."""
     annotation, value = generate(seed)
-    wrong_values = WRONG_JSON
-    if "dict-tuple" in constructors(annotation):
-        wrong_values = tuple(wrong for wrong in WRONG_JSON if not (isinstance(wrong, dict) and wrong))
     parsed = json.loads(serialize_json(value))
     rng = random.Random(f"{seed}/corruption")
     paths = json_paths(parsed)
     documents = []
     for _ in range(count):
-        path, wrong = rng.choice(paths), copy.deepcopy(rng.choice(wrong_values))
+        path, wrong = rng.choice(paths), copy.deepcopy(rng.choice(WRONG_JSON))
         documents.append(replace_at(copy.deepcopy(parsed), path, wrong))
     return documents
 
@@ -1394,11 +1387,6 @@ def test_empty_dataclass_serializes_to_an_empty_object():
     assert serialize_json(EmptyHolder(None)) == '{"e": null}'
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="a dataclass without fields never looks at its data, so it turns null (and an array) into Empty()",
-)
 @pytest.mark.parametrize(
     ("data", "annotation", "expected"),
     [
@@ -1412,11 +1400,6 @@ def test_null_and_arrays_are_not_swallowed_by_a_dataclass_without_fields(data, a
     assert_strictly_equal(deserialize_json(data, annotation), expected)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=pytest.fail.Exception,
-    reason="a dataclass without fields accepts any JSON value; every dataclass with a field raises TypeError",
-)
 @pytest.mark.parametrize(
     "data", [pytest.param("abc", id="str"), pytest.param([1], id="array"), pytest.param(7, id="int")]
 )
@@ -1447,11 +1430,6 @@ def test_nonetype_annotation_round_trips(value, annotation):
     assert_round_trip(value, annotation)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=TypeError,
-    reason="the annotation None (NoneType, PEP 484) raises TypeError: issubclass() arg 1 must be a class",
-)
 @pytest.mark.parametrize(
     ("value", "annotation"),
     [
@@ -1484,14 +1462,13 @@ def test_enum_keys_serialize_by_value(key, expected):
         pytest.param({Priority.HIGH: "x", Priority.LOW: "y"}, dict[Priority, str], Priority.HIGH, 10, id="int-enum"),
     ],
 )
-def test_int_valued_enum_keys_cannot_be_restored_limitation(value, annotation, member, raw):
-    # Documents current behavior, not a promise: a JSON key is always a string, the key is looked up as Rank("2")
-    # instead of Rank(2), and so it matches no member. The same enum as a value does round trip (see the leaf cases).
+def test_int_valued_enum_keys_are_restored_as_members(value, annotation, member, raw):
+    # a JSON key is always a string: "2" is looked up as the key text of Rank.SECOND, not as Rank("2")
     parsed = json.loads(serialize_json(value))
     assert all(isinstance(key, str) for key in parsed)
     assert deserialize_json(raw, type(member)) is member
-    with pytest.raises(TypeError, match="Invalid value for"):
-        deserialize_json(parsed, annotation)
+    restored = assert_round_trip(value, annotation)
+    assert member in restored
 
 
 @pytest.mark.parametrize(
@@ -1525,11 +1502,6 @@ def test_tuple_dict_keys_round_trip(value, annotation):
     assert_round_trip(value, annotation)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=json.JSONDecodeError,
-    reason="a tuple dict key that is not JSON text raises json.JSONDecodeError (a ValueError), not a data-free TypeError",
-)
 @pytest.mark.parametrize(
     "annotation",
     [

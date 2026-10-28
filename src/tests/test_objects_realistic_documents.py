@@ -410,6 +410,9 @@ ORDER_CORRUPTIONS = [
     pytest.param(("shipping_events", "PARCEL-1"), "in transit", id="string-where-event-list-expected"),
     pytest.param(("shipping_events", "PARCEL-2"), {"at": "2026-03-02T08:00:00"}, id="object-where-event-list-expected"),
     pytest.param(("shipping_events",), [["PARCEL-2", []]], id="array-of-pairs-where-event-table-expected"),
+    pytest.param(("shipping_events",), "in transit", id="string-where-event-table-expected"),
+    pytest.param(("shipping_events",), 7, id="number-where-event-table-expected"),
+    pytest.param(("shipping_events",), True, id="bool-where-event-table-expected"),
     pytest.param(("invoice_pdf",), "abc", id="base64-with-bad-padding"),
     pytest.param(("tags",), {"gift": True}, id="object-where-tag-set-expected"),
     pytest.param(("tags",), "gift", id="string-where-tag-set-expected"),
@@ -423,21 +426,6 @@ ORDER_CORRUPTIONS = [
 @pytest.mark.parametrize(("path", "replacement"), ORDER_CORRUPTIONS)
 def test_corrupted_order_is_rejected(path, replacement):
     assert_rejected(FULL_ORDER_JSON, Order, path, replacement)
-
-
-@pytest.mark.parametrize(
-    "bad",
-    [pytest.param("in transit", id="string"), pytest.param(7, id="number"), pytest.param(True, id="bool")],
-)
-def test_primitive_where_a_dict_field_is_expected_is_passed_through_limitation(bad):
-    # Documents current behavior, not a promise: a dict[...] annotation has no handler of its own and JSON primitives
-    # are returned unchecked for such annotations, so the field holds the primitive. Mapping[...], list, tuple and set
-    # annotations raise TypeError for the same input (see the corruptions of the config and of this order).
-    broken = corrupted(FULL_ORDER_JSON, ("shipping_events",), bad)
-
-    restored = deserialize_json(broken, Order)
-
-    assert type(restored.shipping_events) is type(bad) and restored.shipping_events == bad
 
 
 def test_order_whose_metadata_contains_itself_is_rejected():
@@ -880,12 +868,6 @@ def test_windows_path_field_is_serialized_with_its_backslashes():
     assert to_json_value(host) == {"name": "build-01", "install_dir": "C:\\Program Files\\App"}
 
 
-@pytest.mark.xfail(
-    os.name == "posix",
-    raises=AssertionError,
-    strict=True,
-    reason="a PureWindowsPath annotation restores a PosixPath: backslashes stop being separators",
-)
 def test_windows_path_field_restores_as_a_pure_windows_path():
     restored = deserialize_json({"name": "build-01", "install_dir": "C:\\Program Files\\App"}, RemoteHost)
 
@@ -1850,21 +1832,9 @@ def test_numpy_empty_holdout_array_is_not_none():
 @pytest.mark.parametrize(
     "annotation",
     [
-        pytest.param(
-            "ndarray", id="ndarray",
-            marks=pytest.mark.xfail(raises=AssertionError, strict=True,
-                                    reason="Optional[np.ndarray] restores null as array(None, dtype=object)"),
-        ),
-        pytest.param(
-            "float64", id="float64",
-            marks=pytest.mark.xfail(raises=AssertionError, strict=True,
-                                    reason="Optional[np.float64] restores null as nan (np.float64(None))"),
-        ),
-        pytest.param(
-            "bool_", id="bool_",
-            marks=pytest.mark.xfail(raises=AssertionError, strict=True,
-                                    reason="Optional[np.bool_] restores null as False (np.bool_(None))"),
-        ),
+        pytest.param("ndarray", id="ndarray"),
+        pytest.param("float64", id="float64"),
+        pytest.param("bool_", id="bool_"),
         pytest.param("int64", id="int64"),
     ],
 )
@@ -1882,22 +1852,12 @@ def test_training_arrays_without_a_holdout_set_are_written_with_null():
     assert to_json_value(replace(make_training_arrays(), holdout=None))["holdout"] is None
 
 
-@pytest.mark.xfail(
-    raises=AssertionError,
-    strict=True,
-    reason="Optional[np.ndarray] restores null as array(None, dtype=object), so an unset field does not round-trip",
-)
 def test_training_arrays_without_a_holdout_set_round_trip():
     pytest.importorskip("numpy")
 
     assert_round_trip(replace(make_training_arrays(), holdout=None), TrainingArrays)
 
 
-@pytest.mark.xfail(
-    raises=ValueError,
-    strict=True,
-    reason="a ragged array raises numpy's ValueError (the array handler, unlike the scalar one, is not wrapped)",
-)
 def test_ragged_nested_list_for_an_array_field_is_rejected_with_a_type_error():
     np = pytest.importorskip("numpy")
     if np.lib.NumpyVersion(np.__version__) < "1.24.0":
@@ -2362,11 +2322,6 @@ def test_dict_keyed_by_an_int_enum_is_written_with_the_member_values_as_keys():
     assert to_json_value(make_sla_table()) == {"hours": {"1": 72, "2": 24, "3": 4}}
 
 
-@pytest.mark.xfail(
-    raises=TypeError,
-    strict=True,
-    reason="the key of an int-valued Enum is written as '1' but restored with Priority('1'), which raises TypeError",
-)
 def test_dict_keyed_by_an_int_enum_round_trips():
     assert_round_trip(make_sla_table(), SlaTable)
 

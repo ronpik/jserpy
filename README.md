@@ -97,18 +97,40 @@ the same arguments and root values despite its historical name.
 
 JSerPy supports JSON primitives and containers together with:
 
-- dataclasses and `Jsonable` implementations
+- dataclasses (including parameterized generic ones such as `Box[int]`, whose
+  type arguments replace the type variables of the fields) and `Jsonable`
+  implementations
 - enums
-- lists and tuples
+- lists and tuples; a `NamedTuple` annotation restores the named tuple, each
+  field read by its own annotation
 - `bytes` encoded as Base64
 - `datetime.datetime`, `datetime.date`, and `datetime.time` as ISO-8601 strings
 - `Decimal` as a string, preserving precision and trailing zeroes
-- `Path` and `PurePath`
+- `Path` and `PurePath`; the annotation decides the class that is restored
+  (`PureWindowsPath` stays one)
 - general `Mapping` implementations
 - sets and frozensets as deterministically ordered arrays
 - NumPy arrays and scalars when NumPy is installed
 
-Enum and tuple dictionary keys are supported. Serialization raises an error
+Subclasses of `datetime`, `date`, `time`, `Decimal` and `bytes` are written like
+their base class, and restored as the class in the annotation.
+
+The target annotation decides how a JSON value is read, and a value of the wrong
+shape raises `TypeError` (so that a `Union` tries its next member). `NewType`,
+`Annotated[X, ...]` and `Final[X]` stand for the type they wrap. A `dict`
+annotation takes only a JSON object (or `null`, which is what a field missing
+from the data is passed as), and `str`, `int`, `float` and `bool` annotations
+never take an object. A JSON scalar of another kind than a `str`, `int`, `float`
+or `bool` annotation (a text for `int`) is not checked.
+
+NumPy notes: `null` is never read as a NumPy value (`Optional[np.ndarray]` and
+`Optional[np.float64]` give `None`), `np.bytes_` is Base64 like `bytes`, and
+`np.longdouble` is written as a JSON number rounded to double precision.
+`np.clongdouble` and `np.complex128` have no JSON form.
+
+Enum and tuple dictionary keys are supported: an Enum key is written as the text
+of its value (`"2"` for a member with the value `2`) and restored as the member
+with that text. Serialization raises an error
 rather than silently losing data when distinct keys produce the same JSON key.
 Cyclic references, and structures nested more deeply than the `json` module can
 encode, raise `ValueError` as well.

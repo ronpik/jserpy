@@ -793,21 +793,6 @@ def test_replacing_the_unsupported_leaf_makes_the_same_objects_serialize(depth, 
     assert serialize_json_as_obj(root) == chain_json(7, depth)
 
 
-def _stdlib_adds_key_notes() -> bool:
-    """Python 3.14's json adds notes such as "when serializing dict item 'k'" to the errors raised while encoding."""
-    try:
-        json.dumps({"k": [object()]})
-    except TypeError as error:
-        return any("'k'" in note for note in getattr(error, "__notes__", ()))
-    return False
-
-
-@pytest.mark.xfail(
-    _stdlib_adds_key_notes(),
-    raises=AssertionError,
-    strict=True,
-    reason="errors raised while the json module encodes carry notes naming the dict keys on the path (Python 3.14)",
-)
 @pytest.mark.parametrize(
     ("make_value", "options", "exception_type"),
     [
@@ -1921,7 +1906,7 @@ CONTAINER_CASES = [
     *_shape_cases(("featured",), "featured", WRONG_FOR_OPTIONAL_DATACLASS, "Unsupported types"),
     *_shape_cases(("featured", "pages"), "featured-pages", WRONG_FOR_ARRAY, "Unsupported types"),
     *_shape_cases(("pinned",), "pinned", WRONG_FOR_DATACLASS, None),
-    *_shape_cases(("by_color",), "by-color", WRONG_FOR_OBJECT, "Unsupported type for deserialization"),
+    *_shape_cases(("by_color",), "by-color", WRONG_FOR_OBJECT, ("Expected a JSON object for", "dict[")),
     *_shape_cases(("by_color", "blue"), "by-color-records", WRONG_FOR_ARRAY, "JSON array"),
     pytest.param(("by_color",), {SECRET: [record_json(SIBLING)]}, "enum 'Color'", id="by-color-key-not-a-member"),
     pytest.param(
@@ -2129,10 +2114,19 @@ def test_union_of_unions_where_every_branch_fails_names_types_only(data, type_na
     assert_guard_clear()
 
 
-def test_union_with_a_dict_member_hands_any_primitive_through_limitation():
-    # Documents current behavior, not a promise: dict[...] has no handler, and a primitive is handed through as is
-    for data in (SECRET, 7, None, True):
-        assert deserialize_json(data, Choice) == data
+@pytest.mark.parametrize("data", [SECRET, 7, 1.5, True], ids=["str", "int", "float", "bool"])
+def test_union_with_a_dict_member_rejects_a_primitive(data):
+    # the dict member does not hand a scalar through, so no member takes it
+    with pytest.raises(TypeError) as caught:
+        deserialize_json(data, Choice)
+
+    assert str(caught.value).startswith("Unsupported types for deserialization: ")
+    assert_no_secret(caught.value)
+
+
+def test_union_with_a_dict_member_still_takes_null():
+    # null is what a missing dataclass field is passed as, and stays accepted by a dict annotation
+    assert deserialize_json(None, Choice) is None
 
 
 @pytest.mark.parametrize(
@@ -2626,11 +2620,6 @@ def test_bare_tuple_keys_deep_in_a_document_round_trip():
     assert list(restored["g"]) == [(1, "a"), (2, "b")]
 
 
-@pytest.mark.xfail(
-    raises=json.JSONDecodeError,
-    strict=True,
-    reason="a malformed tuple key raises json.JSONDecodeError, a ValueError, where every other mismatch is a TypeError",
-)
 @pytest.mark.parametrize("key", [SECRET, "[1, 2", "", "{'a': 1}"], ids=["words", "truncated", "empty", "single-quotes"])
 def test_malformed_tuple_key_is_a_type_error(key):
     with pytest.raises(TypeError) as caught:
@@ -2639,11 +2628,6 @@ def test_malformed_tuple_key_is_a_type_error(key):
     assert_no_secret(caught.value)
 
 
-@pytest.mark.xfail(
-    raises=json.JSONDecodeError,
-    strict=True,
-    reason="a malformed tuple key raises json.JSONDecodeError, which unions do not catch",
-)
 def test_union_falls_through_to_plain_string_keys_when_a_key_is_not_a_tuple():
     data = {"not a tuple": 1}
 
@@ -2695,19 +2679,36 @@ def test_key_annotations_that_are_not_classes_cannot_be_restored_limitation(key_
         deserialize_json({"a": 1}, dict[key_annotation, int])
 
 
-def test_primitive_targets_accept_any_json_value_limitation():
-    # Documents current behavior, not a promise: a JSON primitive is handed through for annotations without a handler
-    # (dict[...], str, int, float, ...), so a wrong primitive is not a failure; a dict is handed through for str
-    assert deserialize_json({"index": SECRET}, IndexHolder) == IndexHolder(SECRET)
+def test_primitive_targets_accept_any_json_scalar_limitation():
+    # Documents current behavior, not a promise: a JSON scalar is handed through for the annotations without a handler
+    # (str, int, float, ...), so a wrong scalar is not a failure
+    assert deserialize_json(SECRET, int) == SECRET
     assert deserialize_json([SECRET], list[float]) == [SECRET]
-    assert deserialize_json({"a": 1}, Optional[str]) == {"a": 1}
+
+
+def test_dict_target_takes_null_and_nothing_else_that_is_not_an_object():
     assert deserialize_json(None, dict[str, int]) is None
+    for data in (SECRET, 7, [SECRET]):
+        with pytest.raises(TypeError) as caught:
+            deserialize_json(data, dict[str, int])
+
+        assert_no_secret(caught.value)
+
+    with pytest.raises(TypeError) as caught:
+        deserialize_json({"index": SECRET}, IndexHolder)
+
+    assert_no_secret(caught.value)
 
 
-def test_dataclass_without_fields_accepts_any_value_limitation():
-    # Documents current behavior, not a promise: nothing is looked up in the data, so nothing can be wrong with it
-    for data in (SECRET, [SECRET], 7, None, {"x": 1}):
+def test_dataclass_without_fields_takes_an_object_and_ignores_its_keys():
+    for data in ({}, {"x": 1}):
         assert deserialize_json(data, Empty) == Empty()
+
+    for data in (SECRET, [SECRET], 7, None):
+        with pytest.raises(TypeError) as caught:
+            deserialize_json(data, Empty)
+
+        assert_no_secret(caught.value)
 
 
 def test_missing_required_nested_field_becomes_none_limitation():

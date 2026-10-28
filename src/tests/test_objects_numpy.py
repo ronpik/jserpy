@@ -693,8 +693,8 @@ def test_dtype_of_a_parameterized_ndarray_annotation_is_ignored_limitation(scala
 
 # --- ragged and otherwise unrestorable arrays ------------------------------------------------------------------------
 
-_RAGGED_ERROR = pytest.mark.xfail(
-    strict=True, reason="ragged JSON arrays raise NumPy's ValueError, not the TypeError that unions rely on"
+_RAGGED_ERROR = pytest.mark.skipif(
+    np.lib.NumpyVersion(np.__version__) < "1.24.0", reason="older NumPy builds an object array from ragged lists"
 )
 RAGGED = [
     pytest.param([[1], [2, 3]], id="rows-of-different-length"),
@@ -916,11 +916,13 @@ def test_abstract_numpy_scalar_classes_cannot_be_targets(cls):
 
 @_GENERIC_NAT_WARNING
 def test_nat_serializes_as_null_limitation():
-    # Documents current behavior, not a promise: `.item()` of NaT is None, and None is what the text holds.
+    # Documents current behavior, not a promise: `.item()` of NaT is None, and None is what the text holds. A null is
+    # not a NumPy scalar (see test_null_is_not_a_numpy_scalar), so it cannot be read back as a datetime64.
     assert serialize_json(np.datetime64("NaT", "D")) == "null"
     assert serialize_json({"when": np.datetime64("NaT", "s")}) == '{"when": null}'
-    restored = deserialize_json(None, np.datetime64)
-    assert type(restored) is np.datetime64 and np.isnat(restored)
+    with pytest.raises(TypeError):
+        deserialize_json(None, np.datetime64)
+    assert deserialize_json(None, Optional[np.datetime64]) is None
 
 
 def test_nanosecond_datetime64_serializes_as_an_integer_limitation():
@@ -1019,19 +1021,16 @@ class LabelledReading:
     label: np.str_
 
 
-def test_null_for_a_bare_numpy_scalar_target_is_converted_by_numpy_limitation():
-    # Documents current behavior, not a promise: NumPy constructors accept None, so a null (or a dataclass field
-    # missing from the data, which is passed as None) becomes nan / 'None' / False; integer classes raise instead.
-    assert np.isnan(deserialize_json(None, np.float64))
-    assert type(deserialize_json(None, np.float32)) is np.float32
-    assert_strictly_equal(deserialize_json(None, np.str_), np.str_("None"))
-    assert_strictly_equal(deserialize_json(None, np.bool_), np.bool_(False))
-    for cls in (np.int8, np.int64, np.uint16):
-        with pytest.raises(TypeError, match="Invalid value for"):
+def test_null_is_not_a_numpy_scalar():
+    # NumPy constructors accept None (np.float64(None) is nan, np.str_(None) 'None', np.bool_(None) False): none of
+    # that is a restored null, and an Optional wants the null for None. A dataclass field missing from the data is
+    # passed as None, so it is refused too.
+    for cls in (np.float64, np.float32, np.str_, np.bool_, np.int8, np.int64, np.uint16):
+        with pytest.raises(TypeError):
             deserialize_json(None, cls)
 
-    restored = deserialize_json({}, LabelledReading)
-    assert np.isnan(restored.reading) and restored.label == "None"
+    with pytest.raises(TypeError):
+        deserialize_json({}, LabelledReading)
 
 
 @pytest.mark.parametrize(
@@ -1041,50 +1040,83 @@ def test_null_for_a_bare_numpy_scalar_target_is_converted_by_numpy_limitation():
         pytest.param(np.bytes_(b"\x00\xff binary"), id="binary"),
     ],
 )
-@pytest.mark.xfail(strict=True, reason="np.bytes_ serializes as Base64 text, but deserializing does not decode it")
 def test_bytes_scalar_round_trips(value):
     assert_round_trip(value, np.bytes_)
 
 
-_LONG_DOUBLE_LOOPS = pytest.mark.xfail(
-    strict=True, reason="item() of a long double is a long double again: 'nested too deeply' after ~200k handler passes"
-)
+def test_bytes_scalar_is_base64_text_both_ways():
+    assert serialize_json(np.bytes_(b"ab")) == '"YWI="'
+    assert_strictly_equal(deserialize_json("YWI=", np.bytes_), np.bytes_(b"ab"))
+    assert_strictly_equal(deserialize_json(["YWI="], list[np.bytes_]), [np.bytes_(b"ab")])
 
 
+@pytest.mark.parametrize("data", [5, None, ["YWI="], {"a": "YWI="}, "abc"])
+def test_bytes_scalar_rejects_what_is_no_base64_text(data):
+    # "abc" is no valid Base64 length
+    with pytest.raises(TypeError):
+        deserialize_json(data, np.bytes_)
+
+
+# NumPy's long double has no Python type: item() of one is the scalar again. It is written as the nearest Python
+# number, a float: a JSON number rounded to double precision (on a platform whose long double is wider than a double,
+# e.g. Linux x86-64; it is a double on macOS arm64 and on Windows). The complex long double has no JSON form, like
+# np.complex128.
 @pytest.mark.parametrize(
     ("make", "number_text"),
     [
-        pytest.param(lambda: np.longdouble(1.5), 1.5, marks=_LONG_DOUBLE_LOOPS, id="longdouble-scalar"),
-        pytest.param(
-            lambda: np.array([1.5], dtype=np.longdouble), [1.5], marks=_LONG_DOUBLE_LOOPS, id="longdouble-array"
-        ),
-        pytest.param(
-            lambda: {"x": [np.longdouble(1.5)]}, {"x": [1.5]}, marks=_LONG_DOUBLE_LOOPS, id="longdouble-nested"
-        ),
+        pytest.param(lambda: np.longdouble(1.5), 1.5, id="longdouble-scalar"),
+        pytest.param(lambda: np.array([1.5], dtype=np.longdouble), [1.5], id="longdouble-array"),
+        pytest.param(lambda: {"x": [np.longdouble(1.5)]}, {"x": [1.5]}, id="longdouble-nested"),
+        pytest.param(lambda: np.longdouble(-2), -2.0, id="longdouble-integer"),
     ],
 )
-def test_long_double_serializes_as_a_number_or_is_rejected_as_unsupported(make, number_text):
-    # Either answer is acceptable (complex and timedelta64 raise TypeError); the endless loop is not.
-    try:
-        text = serialize_json(make())
-    except TypeError:
-        return
-    assert json.loads(text) == number_text
+def test_long_double_serializes_as_a_number(make, number_text):
+    assert json.loads(serialize_json(make())) == number_text
 
 
 @pytest.mark.parametrize(
     "make",
     [
-        pytest.param(lambda: np.clongdouble(1.5), marks=_LONG_DOUBLE_LOOPS, id="clongdouble-scalar"),
-        pytest.param(lambda: np.array([1.5], dtype=np.clongdouble), marks=_LONG_DOUBLE_LOOPS, id="clongdouble-array"),
+        pytest.param(lambda: np.clongdouble(1.5), id="clongdouble-scalar"),
+        pytest.param(lambda: np.array([1.5], dtype=np.clongdouble), id="clongdouble-array"),
+        pytest.param(lambda: {"z": [np.clongdouble(1 + 2j)]}, id="clongdouble-nested"),
     ],
 )
-def test_complex_long_double_serializes_or_is_rejected_as_unsupported(make):
-    try:
-        text = serialize_json(make())
-    except TypeError:
-        return
-    json.loads(text)  # a pair of numbers would do as well: only the endless loop is a defect
+def test_complex_long_double_is_rejected_as_unsupported(make):
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        serialize_json(make())
+
+
+def test_complex_long_double_reaches_the_fallback_as_a_python_complex():
+    assert serialize_json(np.clongdouble(1 + 2j), fallback=lambda value: [value.real, value.imag]) == "[1.0, 2.0]"
+
+
+@pytest.mark.parametrize(
+    ("value", "annotation"),
+    [
+        pytest.param(np.longdouble(1.5), np.longdouble, id="scalar"),
+        pytest.param([np.longdouble(0.25), np.longdouble(-3)], list[np.longdouble], id="list"),
+        pytest.param(np.array([1.5, 2.5], dtype=np.longdouble), np.ndarray, id="array-as-float64"),
+    ],
+)
+def test_long_double_of_a_value_a_double_holds_round_trips(value, annotation):
+    text = serialize_json(value)
+    restored = deserialize_json(json.loads(text), annotation)
+
+    if annotation is np.ndarray:
+        assert restored.dtype == np.float64 and restored.tolist() == value.tolist()  # the dtype is not in the JSON
+    else:
+        assert_strictly_equal(restored, value)
+
+
+@pytest.mark.skipif(np.finfo(np.longdouble).bits <= 64, reason="long double is a double on this platform")
+def test_long_double_precision_beyond_a_double_is_lost_limitation():
+    # Documents current behavior, not a promise: the number written is the double nearest to the long double
+    value = np.longdouble(1) + np.finfo(np.longdouble).eps
+    assert value != 1
+
+    assert json.loads(serialize_json(value)) == 1.0
+    assert deserialize_json(json.loads(serialize_json(value)), np.longdouble) != value
 
 
 # --- scalars as dataclass fields and inside containers ----------------------------------------------------------------
@@ -1239,11 +1271,6 @@ def test_optional_numpy_scalars_restore_present_values_with_their_class(cls, dat
         assert_strictly_equal(deserialize_json(data, annotation), cls(data))
 
 
-_NULL_BECOMES_A_VALUE = pytest.mark.xfail(
-    strict=True, reason="Optional[NumPy scalar]: the NumPy member converts null (np.float64(None) is nan) before None"
-)
-
-
 @_GENERIC_NAT_WARNING
 @pytest.mark.parametrize(
     "cls",
@@ -1251,13 +1278,13 @@ _NULL_BECOMES_A_VALUE = pytest.mark.xfail(
         pytest.param(np.int8, id="int8"),
         pytest.param(np.uint16, id="uint16"),
         pytest.param(np.int64, id="int64"),
-        pytest.param(np.float16, marks=_NULL_BECOMES_A_VALUE, id="float16"),
-        pytest.param(np.float32, marks=_NULL_BECOMES_A_VALUE, id="float32"),
-        pytest.param(np.float64, marks=_NULL_BECOMES_A_VALUE, id="float64"),
-        pytest.param(np.bool_, marks=_NULL_BECOMES_A_VALUE, id="bool"),
-        pytest.param(np.str_, marks=_NULL_BECOMES_A_VALUE, id="str"),
-        pytest.param(np.bytes_, marks=_NULL_BECOMES_A_VALUE, id="bytes"),
-        pytest.param(np.datetime64, marks=_NULL_BECOMES_A_VALUE, id="datetime64"),
+        pytest.param(np.float16, id="float16"),
+        pytest.param(np.float32, id="float32"),
+        pytest.param(np.float64, id="float64"),
+        pytest.param(np.bool_, id="bool"),
+        pytest.param(np.str_, id="str"),
+        pytest.param(np.bytes_, id="bytes"),
+        pytest.param(np.datetime64, id="datetime64"),
     ],
 )
 def test_optional_numpy_scalar_restores_null_as_none(cls):
@@ -1282,14 +1309,12 @@ class MaybeScale:
             list[Optional[np.float64]],
             [1.5, None, 2.5],
             [np.float64(1.5), None, np.float64(2.5)],
-            marks=_NULL_BECOMES_A_VALUE,
             id="float64-in-list",
         ),
         pytest.param(
             dict[str, Optional[np.str_]],
             {"a": None, "b": "x"},
             {"a": None, "b": np.str_("x")},
-            marks=_NULL_BECOMES_A_VALUE,
             id="str-in-dict",
         ),
     ],
@@ -1299,7 +1324,6 @@ def test_nulls_among_optional_numpy_scalars_stay_none(annotation, data, expected
     assert_strictly_equal(deserialize_json(data, annotation), expected)
 
 
-@_NULL_BECOMES_A_VALUE
 def test_optional_numpy_scalar_field_set_to_none_round_trips():
     restored = assert_round_trip(MaybeScale(), MaybeScale)
 
@@ -1612,16 +1636,20 @@ def test_optional_array_field_with_an_array_round_trips():
     assert type(restored.values) is np.ndarray
 
 
-@pytest.mark.xfail(strict=True, reason="Optional[np.ndarray]: np.array(None) accepts null, so None is never reached")
 def test_optional_array_field_set_to_none_round_trips():
     restored = assert_round_trip(MaybeArray(), MaybeArray)
 
     assert restored.values is None
 
 
-@pytest.mark.xfail(strict=True, reason="Optional[np.ndarray]: np.array(None) accepts null, so None is never reached")
 def test_optional_array_restores_null_as_none():
     assert deserialize_json(None, Optional[np.ndarray]) is None
+
+
+def test_null_is_not_an_array():
+    # np.array(None) is a 0-d object array: a null (or a dataclass field missing from the data) is refused instead
+    with pytest.raises(TypeError):
+        deserialize_json(None, np.ndarray)
 
 
 @dataclass

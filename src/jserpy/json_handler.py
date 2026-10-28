@@ -868,8 +868,12 @@ class DataclassJsonSerializingHandler(JsonSerializingHandler[DC]):
         not_init = {}
         # `cls` is also an alias of a generic dataclass such as `Box[int]`: the fields and the constructor are those of
         # the class itself
-        dataclass_cls = typing.get_origin(cls) or cls
-        field_types = _parameterized_field_types(cls)
+        if type(cls) is type:
+            dataclass_cls = cls
+            field_types = _dataclass_field_types(cls)
+        else:
+            dataclass_cls = typing.get_origin(cls) or cls
+            field_types = _parameterized_field_types(cls)
         # Iterate through each field of the dataclass
         for field in fields(dataclass_cls):
             field_name = field.name
@@ -1307,7 +1311,8 @@ def _run_deserialize_steps_stack(stack: list[_DeserializeSteps]) -> Any:
 
 def _enter_deserialization(data: JSON, cls: Any, stack: list[_DeserializeSteps]) -> Any:
     """Return `data` deserialized as `cls`, or `_PENDING` after pushing the steps of a container onto `stack`."""
-    cls = _normalize_annotation(cls)
+    if not isinstance(cls, type):
+        cls = _normalize_annotation(cls)
 
     if cls is Any:
         return _copy_json(data)
@@ -1320,6 +1325,10 @@ def _enter_deserialization(data: JSON, cls: Any, stack: list[_DeserializeSteps])
         if data is not None:
             raise TypeError(f"Expected null, got {type(data).__name__}")
         return None
+
+    if cls is str or cls is int or cls is bool or cls is float:
+        # no handler to look for
+        return _enter_without_handler(data, cls)
 
     handler = _get_handler(cls)
     if handler is UnionJsonSerializingHandler:
@@ -1346,6 +1355,12 @@ def _enter_deserialization(data: JSON, cls: Any, stack: list[_DeserializeSteps])
             return _push_deserialize_steps(_dict_value_steps(data, value_cls), stack)
         # a bare dict or typing.Dict is passed through as is: copied below
 
+    return _enter_without_handler(data, cls)
+
+
+def _enter_without_handler(data: JSON, cls: Any) -> Any:
+    """Return `data` as `cls`, an annotation with no handler (and no dict): scalars pass through unchecked, objects
+    unless the annotation is a text or a number, arrays never do."""
     if isinstance(data, dict):
         if isinstance(cls, TypeVar):
             # a type parameter that no type argument replaced (e.g. the T of a plain `Box`): only a scalar passes

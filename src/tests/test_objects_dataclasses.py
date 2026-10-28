@@ -54,12 +54,6 @@ UNION_PRIMITIVE_MEMBER_DEFECT = pytest.mark.xfail(
     raises=AssertionError,
     reason="a JSON object is returned as a plain dict by a primitive member (int, str) listed before the dataclass",
 )
-# a missing TypeError is reported by pytest.raises as pytest.fail.Exception, a wrong value by a failed assertion
-EMPTY_DATACLASS_DEFECT = pytest.mark.xfail(
-    strict=True,
-    raises=(AssertionError, pytest.fail.Exception),
-    reason="a dataclass without fields accepts any JSON value, so Optional[Empty] turns null into Empty()",
-)
 TYPING_WRAPPER_DEFECT = pytest.mark.xfail(
     strict=True,
     raises=TypeError,
@@ -177,11 +171,11 @@ def test_empty_dataclass_is_an_empty_object(value, cls, text):
 @pytest.mark.parametrize(
     "data",
     [
-        pytest.param("text", marks=EMPTY_DATACLASS_DEFECT, id="string"),
-        pytest.param(5, marks=EMPTY_DATACLASS_DEFECT, id="number"),
-        pytest.param(True, marks=EMPTY_DATACLASS_DEFECT, id="boolean"),
-        pytest.param([1], marks=EMPTY_DATACLASS_DEFECT, id="array"),
-        pytest.param(None, marks=EMPTY_DATACLASS_DEFECT, id="null"),
+        pytest.param("text", id="string"),
+        pytest.param(5, id="number"),
+        pytest.param(True, id="boolean"),
+        pytest.param([1], id="array"),
+        pytest.param(None, id="null"),
     ],
 )
 def test_data_that_is_not_an_object_is_rejected_for_an_empty_dataclass(data):
@@ -192,10 +186,10 @@ def test_data_that_is_not_an_object_is_rejected_for_an_empty_dataclass(data):
 @pytest.mark.parametrize(
     ("data", "cls", "expected"),
     [
-        pytest.param(None, Optional[Empty], None, marks=EMPTY_DATACLASS_DEFECT, id="null-for-optional"),
-        pytest.param(5, Union[Empty, int], 5, marks=EMPTY_DATACLASS_DEFECT, id="number-after-the-dataclass"),
-        pytest.param("text", Union[Empty, str], "text", marks=EMPTY_DATACLASS_DEFECT, id="string-after-the-dataclass"),
-        pytest.param([1], Union[Empty, List[int]], [1], marks=EMPTY_DATACLASS_DEFECT, id="array-after-the-dataclass"),
+        pytest.param(None, Optional[Empty], None, id="null-for-optional"),
+        pytest.param(5, Union[Empty, int], 5, id="number-after-the-dataclass"),
+        pytest.param("text", Union[Empty, str], "text", id="string-after-the-dataclass"),
+        pytest.param([1], Union[Empty, List[int]], [1], id="array-after-the-dataclass"),
         pytest.param({}, Union[Empty, int], Empty(), id="object-for-the-dataclass"),
         pytest.param(None, Optional[Single], None, id="null-for-optional-dataclass-with-a-field"),
     ],

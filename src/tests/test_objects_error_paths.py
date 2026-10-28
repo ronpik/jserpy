@@ -793,21 +793,6 @@ def test_replacing_the_unsupported_leaf_makes_the_same_objects_serialize(depth, 
     assert serialize_json_as_obj(root) == chain_json(7, depth)
 
 
-def _stdlib_adds_key_notes() -> bool:
-    """Python 3.14's json adds notes such as "when serializing dict item 'k'" to the errors raised while encoding."""
-    try:
-        json.dumps({"k": [object()]})
-    except TypeError as error:
-        return any("'k'" in note for note in getattr(error, "__notes__", ()))
-    return False
-
-
-@pytest.mark.xfail(
-    _stdlib_adds_key_notes(),
-    raises=AssertionError,
-    strict=True,
-    reason="errors raised while the json module encodes carry notes naming the dict keys on the path (Python 3.14)",
-)
 @pytest.mark.parametrize(
     ("make_value", "options", "exception_type"),
     [
@@ -2626,11 +2611,6 @@ def test_bare_tuple_keys_deep_in_a_document_round_trip():
     assert list(restored["g"]) == [(1, "a"), (2, "b")]
 
 
-@pytest.mark.xfail(
-    raises=json.JSONDecodeError,
-    strict=True,
-    reason="a malformed tuple key raises json.JSONDecodeError, a ValueError, where every other mismatch is a TypeError",
-)
 @pytest.mark.parametrize("key", [SECRET, "[1, 2", "", "{'a': 1}"], ids=["words", "truncated", "empty", "single-quotes"])
 def test_malformed_tuple_key_is_a_type_error(key):
     with pytest.raises(TypeError) as caught:
@@ -2639,11 +2619,6 @@ def test_malformed_tuple_key_is_a_type_error(key):
     assert_no_secret(caught.value)
 
 
-@pytest.mark.xfail(
-    raises=json.JSONDecodeError,
-    strict=True,
-    reason="a malformed tuple key raises json.JSONDecodeError, which unions do not catch",
-)
 def test_union_falls_through_to_plain_string_keys_when_a_key_is_not_a_tuple():
     data = {"not a tuple": 1}
 
@@ -2704,10 +2679,15 @@ def test_primitive_targets_accept_any_json_value_limitation():
     assert deserialize_json(None, dict[str, int]) is None
 
 
-def test_dataclass_without_fields_accepts_any_value_limitation():
-    # Documents current behavior, not a promise: nothing is looked up in the data, so nothing can be wrong with it
-    for data in (SECRET, [SECRET], 7, None, {"x": 1}):
+def test_dataclass_without_fields_takes_an_object_and_ignores_its_keys():
+    for data in ({}, {"x": 1}):
         assert deserialize_json(data, Empty) == Empty()
+
+    for data in (SECRET, [SECRET], 7, None):
+        with pytest.raises(TypeError) as caught:
+            deserialize_json(data, Empty)
+
+        assert_no_secret(caught.value)
 
 
 def test_missing_required_nested_field_becomes_none_limitation():

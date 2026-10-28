@@ -1850,21 +1850,9 @@ def test_numpy_empty_holdout_array_is_not_none():
 @pytest.mark.parametrize(
     "annotation",
     [
-        pytest.param(
-            "ndarray", id="ndarray",
-            marks=pytest.mark.xfail(raises=AssertionError, strict=True,
-                                    reason="Optional[np.ndarray] restores null as array(None, dtype=object)"),
-        ),
-        pytest.param(
-            "float64", id="float64",
-            marks=pytest.mark.xfail(raises=AssertionError, strict=True,
-                                    reason="Optional[np.float64] restores null as nan (np.float64(None))"),
-        ),
-        pytest.param(
-            "bool_", id="bool_",
-            marks=pytest.mark.xfail(raises=AssertionError, strict=True,
-                                    reason="Optional[np.bool_] restores null as False (np.bool_(None))"),
-        ),
+        pytest.param("ndarray", id="ndarray"),
+        pytest.param("float64", id="float64"),
+        pytest.param("bool_", id="bool_"),
         pytest.param("int64", id="int64"),
     ],
 )
@@ -1882,22 +1870,12 @@ def test_training_arrays_without_a_holdout_set_are_written_with_null():
     assert to_json_value(replace(make_training_arrays(), holdout=None))["holdout"] is None
 
 
-@pytest.mark.xfail(
-    raises=AssertionError,
-    strict=True,
-    reason="Optional[np.ndarray] restores null as array(None, dtype=object), so an unset field does not round-trip",
-)
 def test_training_arrays_without_a_holdout_set_round_trip():
     pytest.importorskip("numpy")
 
     assert_round_trip(replace(make_training_arrays(), holdout=None), TrainingArrays)
 
 
-@pytest.mark.xfail(
-    raises=ValueError,
-    strict=True,
-    reason="a ragged array raises numpy's ValueError (the array handler, unlike the scalar one, is not wrapped)",
-)
 def test_ragged_nested_list_for_an_array_field_is_rejected_with_a_type_error():
     np = pytest.importorskip("numpy")
     if np.lib.NumpyVersion(np.__version__) < "1.24.0":

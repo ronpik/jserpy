@@ -1558,14 +1558,13 @@ def test_bare_tuple_key_with_a_nested_tuple_cannot_be_restored_limitation():
 @pytest.mark.parametrize(
     ("key", "error", "message"),
     [
-        pytest.param("KEY_SENTINEL", ValueError, "Expecting value", id="not-json"),
+        pytest.param("KEY_SENTINEL", TypeError, "not JSON", id="not-json"),
         pytest.param("5", TypeError, "Expected a JSON array", id="json-number"),
         pytest.param('{"KEY_SENTINEL": 1}', TypeError, "Expected a JSON array", id="json-object"),
     ],
 )
-def test_tuple_key_that_is_not_a_json_array_is_refused_without_the_key_limitation(key, error, message):
-    # Documents current behavior, not a promise: only a key that is a JSON array can be a tuple. A key that is not
-    # JSON at all escapes as the json module's own error (a ValueError, so a Union would not try its next member).
+def test_tuple_key_that_is_not_a_json_array_is_refused_without_the_key(key, error, message):
+    # only a key that is a JSON array can be a tuple; one that is not JSON at all is a TypeError too
     with pytest.raises(error, match=message) as caught:
         deserialize_json({key: 1}, dict[tuple, int])
 

@@ -265,9 +265,15 @@ def convert_tuple_key(t: tuple) -> str:
 
 
 def _restore_tuple_key(key: str, cls: Union[Type[Tuple], GenericAlias]) -> tuple:
-    deserialized_obj = json.loads(key)
-    deserialized_key = deserialize_json(deserialized_obj, cls)
-    return deserialized_key
+    try:
+        deserialized_obj = json.loads(key)
+    except ValueError:
+        # Not JSON text (a JSONDecodeError holds the key itself). Raised outside the handler, so that the original is
+        # neither chained nor kept as `__context__`.
+        pass
+    else:
+        return deserialize_json(deserialized_obj, cls)
+    raise TypeError(f"Expected a JSON array as the mapping key for {cls}, got text that is not JSON")
 
 
 def _reconstruct_key(key: str, cls: Type[T]) -> T:
@@ -398,6 +404,9 @@ class NumpyTypeJsonSerializingHandler(JsonSerializingHandler):
     @staticmethod
     def deserialize(data: JSON, cls: type) -> Any:
         from jserpy._numpy import deserialize_numpy
+        if data is None:
+            # np.float64(None) is nan, np.bool_(None) False, ...: null is not a NumPy scalar (so Optional[...] gets it)
+            raise TypeError(f"Expected a JSON value of a NumPy scalar for {cls}, got NoneType")
         # copied, since np.object_(x) returns x itself
         return _convert(_copy_json(data), cls, partial(deserialize_numpy, cls=cls, kind="scalar"))
 
@@ -664,6 +673,9 @@ class DataclassJsonSerializingHandler(JsonSerializingHandler[DC]):
 
     @staticmethod
     def deserialize_steps(data: JSON, cls: type[DC]) -> _DeserializeSteps:
+        if not isinstance(data, Mapping):
+            # also for a dataclass without fields, which would otherwise never look at its data
+            raise TypeError(f"Expected a JSON object for {cls}, got {type(data).__name__}")
         kwargs = {}
         not_init = {}
         field_types = _dataclass_field_types(cls)
@@ -707,10 +719,15 @@ class NumpyJsonSerializingHandler(JsonSerializingHandler):
     @staticmethod
     def deserialize(data: JSON, cls: type) -> Any:
         from jserpy._numpy import deserialize_numpy
-        array = deserialize_numpy(data, cls, "array")
+        if data is None:
+            # np.array(None) is a 0-d object array: null is not an array (so Optional[...] gets it)
+            raise TypeError(f"Expected a JSON array for {cls}, got NoneType")
+        # a ragged array raises ValueError in NumPy >= 1.24
+        convert = partial(deserialize_numpy, cls=cls, kind="array")
+        array = _convert(data, cls, convert)
         if array.dtype == object:
             # an object array holds the input's own dicts and lists: build it from a copy instead
-            array = deserialize_numpy(_copy_json(data), cls, "array")
+            array = _convert(_copy_json(data), cls, convert)
         return array
 
 
@@ -912,10 +929,30 @@ def _encode_json(
             sort_keys=sort_keys,
             _jserpy_context=context,
         )
-    except ValueError as error:
+    except (TypeError, ValueError, RecursionError) as error:
+        _drop_encoder_notes(error)
         if str(error) == "Circular reference detected":
             raise ValueError("Cyclic reference detected during JSON serialization") from error
         raise
+
+
+_ENCODER_NOTE_PREFIX = "when serializing "
+
+
+def _drop_encoder_notes(error: BaseException) -> None:
+    """Remove the notes that the `json` module (Python 3.14) adds to an error raised while it encodes.
+
+    They name the dict keys and list positions on the path to the value, e.g. "when serializing dict item 'k'", and
+    would leak the data into otherwise data-free errors. Notes of anyone else are kept.
+    """
+    notes = getattr(error, "__notes__", None)
+    if not notes:
+        return
+    kept = [note for note in notes if not (isinstance(note, str) and note.startswith(_ENCODER_NOTE_PREFIX))]
+    if kept:
+        error.__notes__ = kept
+    else:
+        del error.__notes__
 
 
 def serialize_json(
@@ -1054,8 +1091,8 @@ def _enter_deserialization(data: JSON, cls: Any, stack: list[_DeserializeSteps])
         return _copy_json(data)
 
     if cls is float and type(data) is int:
-        # JSON from non-Python encoders may write whole floats as ints
-        return float(data)
+        # JSON from non-Python encoders may write whole floats as ints (one too large for a float is a mismatch)
+        return _convert(data, cls, float)
 
     if cls is type(None):
         if data is not None:

@@ -809,11 +809,6 @@ def test_float_before_int_in_a_union_coerces_whole_numbers_limitation():
     assert type(deserialize_json(3.0, int | float)) is float
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=OverflowError,
-    reason="an int too large for a float escapes as OverflowError instead of the TypeError of a data mismatch",
-)
 @pytest.mark.parametrize(
     "annotation",
     [pytest.param(float, id="float"), pytest.param(float | None, id="optional-float")],
@@ -823,11 +818,6 @@ def test_huge_int_for_a_float_annotation_is_a_type_error(annotation):
         deserialize_json(10**400, annotation)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=OverflowError,
-    reason="an int too large for a float escapes as OverflowError, so the union cannot fall through to int",
-)
 def test_huge_int_falls_through_a_float_union_to_int():
     assert deserialize_json(10**400, float | int) == 10**400
 

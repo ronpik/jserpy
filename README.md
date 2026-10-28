@@ -97,9 +97,12 @@ the same arguments and root values despite its historical name.
 
 JSerPy supports JSON primitives and containers together with:
 
-- dataclasses and `Jsonable` implementations
+- dataclasses (including parameterized generic ones such as `Box[int]`, whose
+  type arguments replace the type variables of the fields) and `Jsonable`
+  implementations
 - enums
-- lists and tuples
+- lists and tuples; a `NamedTuple` annotation restores the named tuple, each
+  field read by its own annotation
 - `bytes` encoded as Base64
 - `datetime.datetime`, `datetime.date`, and `datetime.time` as ISO-8601 strings
 - `Decimal` as a string, preserving precision and trailing zeroes
@@ -111,6 +114,14 @@ JSerPy supports JSON primitives and containers together with:
 
 Subclasses of `datetime`, `date`, `time`, `Decimal` and `bytes` are written like
 their base class, and restored as the class in the annotation.
+
+The target annotation decides how a JSON value is read, and a value of the wrong
+shape raises `TypeError` (so that a `Union` tries its next member). `NewType`,
+`Annotated[X, ...]` and `Final[X]` stand for the type they wrap. A `dict`
+annotation takes only a JSON object (or `null`, which is what a field missing
+from the data is passed as), and `str`, `int`, `float` and `bool` annotations
+never take an object. A JSON scalar of another kind than a `str`, `int`, `float`
+or `bool` annotation (a text for `int`) is not checked.
 
 NumPy notes: `null` is never read as a NumPy value (`Optional[np.ndarray]` and
 `Optional[np.float64]` give `None`), `np.bytes_` is Base64 like `bytes`, and

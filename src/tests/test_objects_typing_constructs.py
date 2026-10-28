@@ -1025,6 +1025,18 @@ def test_primitive_annotation_refuses_a_json_object(annotation):
     assert "LEAK" not in str(caught.value)
 
 
+@pytest.mark.parametrize(
+    "annotation",
+    [bytes, Decimal, datetime.date, datetime.datetime, Path, Color, Level],
+    ids=lambda annotation: annotation.__name__,
+)
+def test_annotations_with_a_handler_refuse_a_json_object(annotation):
+    with pytest.raises(TypeError) as caught:
+        deserialize_json({"LEAK": "LEAK"}, annotation)
+
+    assert "LEAK" not in str(caught.value)
+
+
 def test_object_and_any_annotations_still_hand_an_object_through_as_an_independent_copy():
     data = {"a": [1, {"b": 2}]}
 

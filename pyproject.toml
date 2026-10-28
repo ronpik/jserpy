@@ -32,3 +32,9 @@ numpy = [
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["jserpy*"]
+
+[tool.pytest.ini_options]
+# The tests import their shared helpers (objects_support) as top-level modules. Under
+# --import-mode=importlib, which the release validation uses, nothing else puts this directory on
+# sys.path.
+pythonpath = ["src/tests"]

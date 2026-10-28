@@ -1194,25 +1194,29 @@ def _enter_deserialization(data: JSON, cls: Any, stack: list[_DeserializeSteps])
             return handler.deserialize(data, cls)
         return _push_deserialize_steps(deserialize_steps(data, cls), stack)
 
+    dict_cls = typing.get_origin(cls) or cls
+    if isinstance(dict_cls, type) and issubclass(dict_cls, dict) and data is not None:
+        # dict[K, V], a bare dict or typing.Dict, Counter, a dict subclass: a JSON object, like Mapping and unlike a
+        # scalar or an array, which unions need to refuse. (null stays: it is what a missing dataclass field is.)
+        if not isinstance(data, dict):
+            raise TypeError(f"Expected a JSON object for {cls}, got {type(data).__name__}")
+        generic_args = get_args(cls)
+        if len(generic_args) == 1 and issubclass(dict_cls, Counter):
+            # Counter[K]: the counts are ints
+            generic_args = (generic_args[0], int)
+        if generic_args:
+            key_cls, value_cls = generic_args
+            data = _deserialize_keys(data, key_cls)
+            return _push_deserialize_steps(_dict_value_steps(data, value_cls), stack)
+        # a bare dict or typing.Dict is passed through as is: copied below
+
     if isinstance(data, dict):
-        if is_generic_type(cls):
-            origin_type = get_origin(cls)
-            if issubclass(origin_type, dict):
-                generic_args = get_args(cls)
-                if len(generic_args) == 1 and issubclass(origin_type, Counter):
-                    # Counter[K]: the counts are ints
-                    generic_args = (generic_args[0], int)
-                if generic_args:
-                    key_cls, value_cls = generic_args
-                    data = _deserialize_keys(data, key_cls)
-                    return _push_deserialize_steps(_dict_value_steps(data, value_cls), stack)
-                # a bare typing.Dict (like an unparameterized dict) falls through to the copy below
+        if not is_generic_type(cls):
+            if issubclass(cls, Jsonable):
+                return JsonableSerializingHandler.deserialize(data, cls)
 
-        elif issubclass(cls, Jsonable):
-            return JsonableSerializingHandler.deserialize(data, cls)
-
-        elif is_dataclass(cls):
-            return _push_deserialize_steps(DataclassJsonSerializingHandler.deserialize_steps(data, cls), stack)
+            if is_dataclass(cls):
+                return _push_deserialize_steps(DataclassJsonSerializingHandler.deserialize_steps(data, cls), stack)
 
         # passed through as is (e.g. an unparameterized `dict`): copy, so that the result does not alias the input
         return _copy_json(data)

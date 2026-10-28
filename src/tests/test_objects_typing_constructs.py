@@ -1020,24 +1020,14 @@ def test_object_member_before_a_primitive_member_gives_id_or_object_unions(annot
     assert_strictly_equal(deserialize_json(data, annotation), expected)
 
 
-# A parameterized dict, unlike list/tuple/set/Mapping, takes a JSON scalar as is instead of raising TypeError, so it
-# also claims the scalars that a later union member should get.
-@pytest.mark.xfail(
-    strict=True,
-    raises=pytest.fail.Exception,
-    reason="dict[K, V] returns a JSON scalar unchanged instead of raising TypeError (Mapping[K, V] raises)",
-)
+# A dict annotation, like list/tuple/set/Mapping, raises TypeError for a JSON scalar, so that it does not claim the
+# scalars that a later union member should get.
 @pytest.mark.parametrize("data", ["abc", 5, 1.5, True], ids=["str", "int", "float", "bool"])
 def test_parameterized_dict_annotation_rejects_a_scalar(data):
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match=r"Expected a JSON object for .*, got " + type(data).__name__):
         deserialize_json(data, dict[str, int])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="dict[K, V] returns a JSON scalar unchanged instead of raising TypeError, so it claims the str",
-)
 def test_parameterized_dict_member_does_not_claim_a_string_wanted_by_a_later_member():
     assert deserialize_json("red", Union[dict[str, int], Color]) is Color.RED
 

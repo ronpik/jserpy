@@ -312,7 +312,7 @@ def test_dataclass_with_list_fields_has_declaration_order_and_round_trips():
     ("data", "annotation", "message"),
     [
         pytest.param(["LEAK", "LEAK"], list[list[int]], "Expected a JSON array", id="strings-for-lists"),
-        pytest.param([["LEAK"]], list[dict[str, int]], "Unsupported type for deserialization", id="list-for-dict"),
+        pytest.param([["LEAK"]], list[dict[str, int]], "Expected a JSON object", id="list-for-dict"),
         pytest.param({"a": ["LEAK"]}, list[list[int]], "Expected a JSON array", id="object-for-list"),
         pytest.param(
             [["LEAK"], {"LEAK": "LEAK"}], list[list[str]], "Expected a JSON array", id="object-among-lists"

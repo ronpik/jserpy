@@ -578,12 +578,19 @@ def test_item_of_the_wrong_shape_is_rejected(data, cls):
         deserialize_json(data, cls)
 
 
-def test_dict_field_given_a_json_primitive_passes_it_through_limitation():
-    # Documents current behavior, not a promise: Mapping[str, int] rejects the same data, dict[str, int] does not.
-    assert deserialize_json({"mapping": "abc"}, DictHolder).mapping == "abc"
-    assert deserialize_json({"mapping": 5}, DictHolder).mapping == 5
+@pytest.mark.parametrize("bad", [pytest.param("abc", id="string"), pytest.param(5, id="number"), pytest.param([1], id="array")])
+def test_dict_field_given_something_other_than_an_object_is_rejected(bad):
+    # dict[str, int] refuses what Mapping[str, int] refuses
     with pytest.raises(TypeError):
-        deserialize_json("abc", Mapping[str, int])
+        deserialize_json({"mapping": bad}, DictHolder)
+    with pytest.raises(TypeError):
+        deserialize_json(bad, Mapping[str, int])
+
+
+def test_dict_field_still_takes_null_and_a_missing_value_as_none():
+    # null is what a field absent from the data is passed as
+    assert deserialize_json({"mapping": None}, DictHolder).mapping is None
+    assert deserialize_json({}, DictHolder).mapping is None
 
 
 @pytest.mark.parametrize(

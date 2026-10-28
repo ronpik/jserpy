@@ -1430,11 +1430,6 @@ def test_nonetype_annotation_round_trips(value, annotation):
     assert_round_trip(value, annotation)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=TypeError,
-    reason="the annotation None (NoneType, PEP 484) raises TypeError: issubclass() arg 1 must be a class",
-)
 @pytest.mark.parametrize(
     ("value", "annotation"),
     [

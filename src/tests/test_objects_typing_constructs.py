@@ -1996,20 +1996,10 @@ def test_bare_container_annotations(annotation, data, expected):
     assert_strictly_equal(deserialize_json(data, annotation), expected)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ValueError,
-    reason="bare typing.Dict raises ValueError (unpacking its missing type arguments); bare dict and Mapping pass",
-)
 def test_bare_typing_dict_passes_the_object_through():
     assert_strictly_equal(deserialize_json({"a": [1]}, Dict), {"a": [1]})
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=(TypeError, ValueError),  # which one depends on the Python version: Any is a class from 3.11
-    reason="dict[Any, V] raises (key restoration cannot handle Any) unlike Mapping[Any, V]",
-)
 @pytest.mark.parametrize(
     "annotation",
     [dict[Any, int], Dict[Any, int], Dict[Any, Any]],

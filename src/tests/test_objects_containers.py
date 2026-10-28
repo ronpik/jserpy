@@ -430,10 +430,23 @@ def test_fixed_tuple_with_a_wrongly_shaped_member_raises_type_error():
         deserialize_json(["x", 1], tuple[list[int], int])
 
 
-@pytest.mark.xfail(strict=True, reason="tuple[()] (an empty tuple) accepts any array: [1] restores as (1,)")
 def test_empty_tuple_annotation_rejects_a_non_empty_array():
     with pytest.raises(TypeError):
         deserialize_json([1], tuple[()])
+
+
+@pytest.mark.parametrize("annotation", [tuple[()], typing.Tuple[()]], ids=["tuple", "typing-Tuple"])
+def test_empty_tuple_annotation_is_a_fixed_length_of_zero(annotation):
+    # unlike the bare tuple, which takes any array; get_args() of both is () from Python 3.11
+    assert_strictly_equal(deserialize_json([], annotation), ())
+    for data in ([1], [None], ["x", 2]):
+        with pytest.raises(TypeError, match="length 0"):
+            deserialize_json(data, annotation)
+
+    assert_strictly_equal(deserialize_json([1, 2], tuple), (1, 2))
+    assert_strictly_equal(deserialize_json([1, 2], typing.Tuple), (1, 2))
+    assert_strictly_equal(deserialize_json([], Union[tuple[()], list[int]]), ())
+    assert_strictly_equal(deserialize_json([1], Union[tuple[()], list[int]]), [1])
 
 
 def test_bare_tuple_annotation_returns_inner_lists_limitation():
@@ -934,10 +947,8 @@ def test_mapping_subclass_targets_restore_a_plain_dict_limitation(value, annotat
         pytest.param(Optional[Counter[str]], id="optional-Counter"),
     ],
 )
-@_xfail("Counter[str] has one type argument and raises ValueError (not enough values to unpack), even inside a union")
 def test_counter_with_a_single_type_argument_is_restored(annotation):
-    # Bare `Counter` restores {"a": 1} (see above), and Counter[str] is its natural annotation; the ValueError is not
-    # the TypeError that the union fall-through and the documented contract use.
+    # Bare `Counter` restores {"a": 1} (see above), and Counter[str] is its natural annotation
     restored = deserialize_json({"a": 1}, annotation)
 
     assert restored == {"a": 1}
@@ -1610,16 +1621,13 @@ def test_key_annotations_that_are_not_classes_are_unsupported_limitation(annotat
         deserialize_json({"a": 1}, annotation)
 
 
-_NONE_ARGUMENT_DEFECT = _xfail("None as a type argument of a builtin generic raises TypeError (issubclass() arg 1)")
-
-
 @pytest.mark.parametrize(
     ("data", "annotation", "expected"),
     [
-        pytest.param([None, None], list[None], [None, None], id="list", marks=_NONE_ARGUMENT_DEFECT),
-        pytest.param([1, None], tuple[int, None], (1, None), id="tuple", marks=_NONE_ARGUMENT_DEFECT),
-        pytest.param({"a": None}, dict[str, None], {"a": None}, id="dict", marks=_NONE_ARGUMENT_DEFECT),
-        pytest.param([None], set[None], {None}, id="set", marks=_NONE_ARGUMENT_DEFECT),
+        pytest.param([None, None], list[None], [None, None], id="list"),
+        pytest.param([1, None], tuple[int, None], (1, None), id="tuple"),
+        pytest.param({"a": None}, dict[str, None], {"a": None}, id="dict"),
+        pytest.param([None], set[None], {None}, id="set"),
     ],
 )
 def test_none_as_a_type_argument_of_a_builtin_generic(data, annotation, expected):

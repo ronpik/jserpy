@@ -841,11 +841,6 @@ def test_null_is_rejected_by_the_none_type_only_for_non_null_data():
         deserialize_json(0, type(None))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=TypeError,
-    reason="an annotation of plain None (a valid spelling of NoneType) reaches issubclass() and fails",
-)
 @pytest.mark.parametrize(
     ("data", "annotation"),
     [

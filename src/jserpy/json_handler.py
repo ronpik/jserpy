@@ -5,6 +5,7 @@ import sys
 import typing
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Mapping
+from collections import Counter
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields, is_dataclass
@@ -295,6 +296,9 @@ def _reconstruct_key(key: str, cls: Type[T]) -> T:
 
 
 def _deserialize_keys(obj: Any, keys_cls: Type[T]) -> Any:
+    if keys_cls is Any:
+        # nothing to restore the keys to: they stay the strings of the JSON object
+        return obj
     if isinstance(obj, list):
         return [_deserialize_keys(item, keys_cls) for item in obj]
     if not isinstance(obj, dict):
@@ -423,6 +427,17 @@ class JsonableSerializingHandler(JsonSerializingHandler[JJ]):
         return cls.from_json(data)
 
 
+def _is_empty_tuple_annotation(cls: Any) -> bool:
+    """Whether `cls` is `tuple[()]` (or `Tuple[()]`), a tuple of length 0, and not a bare `tuple`.
+
+    `get_args` of `tuple[()]` is `((),)` before Python 3.11 and `()` from 3.11, which is what a bare tuple has too.
+    """
+    generic_args = get_args(cls)
+    if generic_args:
+        return generic_args == ((),)
+    return cls is not tuple and cls is not Tuple and typing.get_origin(cls) is tuple
+
+
 class TupleJsonSerializingHandler(JsonSerializingHandler[tuple]):
 
     @staticmethod
@@ -436,6 +451,10 @@ class TupleJsonSerializingHandler(JsonSerializingHandler[tuple]):
     @staticmethod
     def deserialize_steps(data: JSON, cls: type[tuple]) -> _DeserializeSteps:
         _require_json_array(data, cls)
+        if _is_empty_tuple_annotation(cls):
+            if data:
+                raise TypeError(f"Expected a JSON array of length 0 for {cls}, got length {len(data)}")
+            return ()
         generic_args_types = get_args(cls)
         if not generic_args_types:
             return tuple(_copy_json(data if type(data) is list else list(data)))
@@ -540,8 +559,7 @@ class MappingJsonSerializingHandler(JsonSerializingHandler):
         generic_args = get_args(cls)
         if generic_args:
             key_cls, value_cls = generic_args
-            if key_cls is not Any:
-                data = _deserialize_keys(data, key_cls)
+            data = _deserialize_keys(data, key_cls)
             data = yield from _dict_value_steps(data, value_cls)
         else:
             # the values are passed through as is: copy them, so that the result does not alias the input
@@ -1087,6 +1105,10 @@ def _run_deserialize_steps_stack(stack: list[_DeserializeSteps]) -> Any:
 
 def _enter_deserialization(data: JSON, cls: Any, stack: list[_DeserializeSteps]) -> Any:
     """Return `data` deserialized as `cls`, or `_PENDING` after pushing the steps of a container onto `stack`."""
+    if cls is None:
+        # PEP 484: None in an annotation stands for NoneType
+        cls = type(None)
+
     if cls is Any:
         return _copy_json(data)
 
@@ -1112,9 +1134,15 @@ def _enter_deserialization(data: JSON, cls: Any, stack: list[_DeserializeSteps])
         if is_generic_type(cls):
             origin_type = get_origin(cls)
             if issubclass(origin_type, dict):
-                key_cls, value_cls = get_args(cls)
-                data = _deserialize_keys(data, key_cls)
-                return _push_deserialize_steps(_dict_value_steps(data, value_cls), stack)
+                generic_args = get_args(cls)
+                if len(generic_args) == 1 and issubclass(origin_type, Counter):
+                    # Counter[K]: the counts are ints
+                    generic_args = (generic_args[0], int)
+                if generic_args:
+                    key_cls, value_cls = generic_args
+                    data = _deserialize_keys(data, key_cls)
+                    return _push_deserialize_steps(_dict_value_steps(data, value_cls), stack)
+                # a bare typing.Dict (like an unparameterized dict) falls through to the copy below
 
         elif issubclass(cls, Jsonable):
             return JsonableSerializingHandler.deserialize(data, cls)

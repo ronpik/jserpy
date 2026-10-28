@@ -103,12 +103,23 @@ JSerPy supports JSON primitives and containers together with:
 - `bytes` encoded as Base64
 - `datetime.datetime`, `datetime.date`, and `datetime.time` as ISO-8601 strings
 - `Decimal` as a string, preserving precision and trailing zeroes
-- `Path` and `PurePath`
+- `Path` and `PurePath`; the annotation decides the class that is restored
+  (`PureWindowsPath` stays one)
 - general `Mapping` implementations
 - sets and frozensets as deterministically ordered arrays
 - NumPy arrays and scalars when NumPy is installed
 
-Enum and tuple dictionary keys are supported. Serialization raises an error
+Subclasses of `datetime`, `date`, `time`, `Decimal` and `bytes` are written like
+their base class, and restored as the class in the annotation.
+
+NumPy notes: `null` is never read as a NumPy value (`Optional[np.ndarray]` and
+`Optional[np.float64]` give `None`), `np.bytes_` is Base64 like `bytes`, and
+`np.longdouble` is written as a JSON number rounded to double precision.
+`np.clongdouble` and `np.complex128` have no JSON form.
+
+Enum and tuple dictionary keys are supported: an Enum key is written as the text
+of its value (`"2"` for a member with the value `2`) and restored as the member
+with that text. Serialization raises an error
 rather than silently losing data when distinct keys produce the same JSON key.
 Cyclic references, and structures nested more deeply than the `json` module can
 encode, raise `ValueError` as well.

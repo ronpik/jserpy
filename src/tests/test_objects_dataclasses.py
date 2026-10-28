@@ -47,9 +47,6 @@ import pytest
 from jserpy import deserialize_json, serialize_json, serialize_json_as_obj
 from objects_support import assert_round_trip, assert_strictly_equal, to_json_value
 
-# Each mark names the exception its defect makes the test end with (``raises``), so that a mistake in a test, which
-# fails differently, is reported as a failure instead of being absorbed as an expected one.
-
 
 def assert_text(value, expected):
     """``value`` is written as exactly the text ``json.dumps(expected)``: key order and number spelling included."""

@@ -2087,14 +2087,12 @@ def test_type_annotations_are_not_interpreted_limitation(annotation):
         deserialize_json([1], annotation)
 
 
-def test_named_tuple_comes_back_as_a_plain_tuple_limitation():
-    # Documents current behavior, not a promise: a NamedTuple is a tuple subclass, so it serializes as a plain array,
-    # and the target is handled like a bare `tuple`: the result is no NamedPair and its items are not converted.
+def test_named_tuple_serializes_as_a_plain_array_and_comes_back_as_the_named_tuple():
     value = NamedPair(DAY, 3)
 
     assert serialize_json(value) == '["2026-10-27", 3]'
-    assert_strictly_equal(deserialize_json(to_json_value(value), NamedPair), ("2026-10-27", 3))
-    assert_strictly_equal(deserialize_json([["2026-10-27", 3]], list[NamedPair]), [("2026-10-27", 3)])
+    assert_strictly_equal(deserialize_json(to_json_value(value), NamedPair), value)
+    assert_strictly_equal(deserialize_json([["2026-10-27", 3]], list[NamedPair]), [value])
 
 
 def test_typed_dict_values_are_handed_through_unconverted_limitation():

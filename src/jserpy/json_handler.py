@@ -511,6 +511,15 @@ class TupleJsonSerializingHandler(JsonSerializingHandler[tuple]):
     @staticmethod
     def deserialize_steps(data: JSON, cls: type[tuple]) -> _DeserializeSteps:
         _require_json_array(data, cls)
+        if _is_named_tuple(cls):
+            # a NamedTuple is written as a plain array of its fields: the class and the field annotations come back
+            field_types = _named_tuple_field_types(cls)
+            if len(data) != len(field_types):
+                raise TypeError(f"Expected a JSON array of length {len(field_types)} for {cls}, got length {len(data)}")
+            fields_values = []
+            for item, item_type in zip(data, field_types):
+                fields_values.append((yield item, item_type))
+            return cls(*fields_values)
         if _is_empty_tuple_annotation(cls):
             if data:
                 raise TypeError(f"Expected a JSON array of length 0 for {cls}, got length {len(data)}")
@@ -734,15 +743,54 @@ def _dataclass_field_types(cls: type) -> dict[str, Any]:
     globalns = getattr(module, "__dict__", {})
     localns = {cls.__name__: cls} if hasattr(cls, "__name__") else {}
 
-    field_types = {}
-    for field in fields(cls):
-        field_type = field.type
-        if isinstance(field_type, str) or _has_forward_reference(field_type):
-            field_type = resolved_types.get(field.name, field_type)
-        if _has_forward_reference(field_type):
-            field_type = _resolve_forward_references(field_type, globalns, localns)
-        field_types[field.name] = field_type
-    return field_types
+    return {
+        field.name: _resolve_field_annotation(field.type, field.name, resolved_types, globalns, localns)
+        for field in fields(cls)
+    }
+
+
+def _resolve_field_annotation(
+    annotation: Any, name: str, resolved_types: dict[str, Any], globalns: dict[str, Any], localns: dict[str, Any]
+) -> Any:
+    """`annotation` of the field `name`, with the strings and forward references in it evaluated."""
+    if isinstance(annotation, str) or _has_forward_reference(annotation):
+        annotation = resolved_types.get(name, annotation)
+    if _has_forward_reference(annotation):
+        annotation = _resolve_forward_references(annotation, globalns, localns)
+    return annotation
+
+
+@lru_cache(maxsize=None)
+def _named_tuple_field_types(cls: type) -> tuple[Any, ...]:
+    """The annotation of each field of the NamedTuple class `cls`, in field order.
+
+    A field without one (`collections.namedtuple`) is Any.
+    """
+    resolved_types = _resolved_field_types(cls)
+    # what `typing.get_type_hints` could not evaluate stays as written, to fail when that field is deserialized
+    declared: dict[str, Any] = {}
+    for base in reversed(cls.__mro__):
+        base_annotations = getattr(base, "__annotations__", None)
+        if isinstance(base_annotations, dict):
+            declared.update(base_annotations)
+    module = sys.modules.get(getattr(cls, "__module__", None))
+    globalns = getattr(module, "__dict__", {})
+    localns = {cls.__name__: cls}
+    return tuple(
+        _resolve_field_annotation(declared.get(name, Any), name, resolved_types, globalns, localns)
+        for name in cls._fields
+    )
+
+
+def _is_named_tuple(cls: Any) -> bool:
+    """Whether `cls` is a `typing.NamedTuple` or `collections.namedtuple` class (or a subclass of one)."""
+    return (
+        cls is not tuple
+        and isinstance(cls, type)
+        and typing.get_origin(cls) is None  # before Python 3.11 `isinstance(tuple[int], type)` is true
+        and issubclass(cls, tuple)
+        and isinstance(getattr(cls, "_fields", None), tuple)
+    )
 
 
 def _replace_type_variables(annotation: Any, replacements: Mapping[Any, Any]) -> Any:

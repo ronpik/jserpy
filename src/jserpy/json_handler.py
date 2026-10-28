@@ -18,7 +18,7 @@ from typing import Any, TypeVar, Generic, cast, Type, get_origin, get_args, Sequ
 from enum import Enum
 from pathlib import Path, PurePath
 
-from typing_inspect import is_optional_type, is_generic_type, get_origin
+from typing_inspect import is_optional_type, get_origin
 
 from jserpy.json_handler_utils import Dataclass, is_primitive
 from jserpy.json_typing import JSON
@@ -58,6 +58,30 @@ _PENDING = object()
 
 
 _NATIVE_JSON_TYPES = frozenset((str, int, float, bool, type(None)))
+
+
+def _normalize_annotation(cls: Any) -> Any:
+    """Return the annotation that decides how a value is deserialized, with the wrappers around it removed.
+
+    `None` stands for NoneType (PEP 484), `NewType` for its supertype, `Annotated[X, ...]` and `Final[X]` for X (a bare
+    `Final` says nothing, so it stands for Any). They nest (`Final[Annotated[UserId, ...]]`). Everything else, such as
+    `Optional[UserId]` or `list[UserId]`, is returned as it is: the wrappers inside it are removed when the members of
+    the union or the items of the container are entered.
+    """
+    while not isinstance(cls, type):
+        if cls is None:
+            return type(None)
+        # not isinstance(cls, typing.NewType): typing_extensions has a NewType of its own before Python 3.10
+        supertype = getattr(cls, "__supertype__", None)
+        if supertype is not None:
+            cls = supertype
+        elif typing.get_origin(cls) in (typing.Annotated, typing.Final):
+            cls = typing.get_args(cls)[0]
+        elif cls is typing.Final:
+            return Any
+        else:
+            return cls
+    return cls
 
 
 def _is_jsonable_primitive(value: Any) -> bool:
@@ -331,6 +355,7 @@ def _reconstruct_key(key: str, cls: Type[T]) -> T:
 
 
 def _deserialize_keys(obj: Any, keys_cls: Type[T]) -> Any:
+    keys_cls = _normalize_annotation(keys_cls)
     if keys_cls is Any:
         # nothing to restore the keys to: they stay the strings of the JSON object
         return obj
@@ -486,6 +511,15 @@ class TupleJsonSerializingHandler(JsonSerializingHandler[tuple]):
     @staticmethod
     def deserialize_steps(data: JSON, cls: type[tuple]) -> _DeserializeSteps:
         _require_json_array(data, cls)
+        if _is_named_tuple(cls):
+            # a NamedTuple is written as a plain array of its fields: the class and the field annotations come back
+            field_types = _named_tuple_field_types(cls)
+            if len(data) != len(field_types):
+                raise TypeError(f"Expected a JSON array of length {len(field_types)} for {cls}, got length {len(data)}")
+            fields_values = []
+            for item, item_type in zip(data, field_types):
+                fields_values.append((yield item, item_type))
+            return cls(*fields_values)
         if _is_empty_tuple_annotation(cls):
             if data:
                 raise TypeError(f"Expected a JSON array of length 0 for {cls}, got length {len(data)}")
@@ -646,7 +680,7 @@ def _resolved_field_types(cls: type) -> dict[str, Any]:
 def _has_forward_reference(annotation: Any) -> bool:
     """Whether `annotation` holds a string or `ForwardRef`, e.g. `Optional["Node"]` or `list["Node"]`.
 
-    The type arguments of `Literal` (values) and `Annotated` (metadata) are not annotations; they are skipped.
+    The type arguments of `Literal` (values) and the metadata of `Annotated` are not annotations; they are skipped.
     Iterative, since annotations can nest as deeply as the data.
     """
     pending = [annotation]
@@ -654,7 +688,11 @@ def _has_forward_reference(annotation: Any) -> bool:
         item = pending.pop()
         if isinstance(item, (str, typing.ForwardRef)):
             return True
-        if typing.get_origin(item) in (typing.Literal, typing.Annotated):
+        origin = typing.get_origin(item)
+        if origin is typing.Literal:
+            continue
+        if origin is typing.Annotated:
+            pending.append(typing.get_args(item)[0])
             continue
         pending.extend(typing.get_args(item))
     return False
@@ -677,8 +715,13 @@ def _resolve_forward_references(annotation: Any, globalns: dict[str, Any], local
         return _resolve_forward_references(evaluated, globalns, localns)
 
     args = typing.get_args(annotation)
-    if not args or typing.get_origin(annotation) in (typing.Literal, typing.Annotated):
+    origin = typing.get_origin(annotation)
+    if not args or origin is typing.Literal:
         return annotation
+    if origin is typing.Annotated:
+        # only the first argument is an annotation, the others are metadata
+        resolved = _resolve_forward_references(args[0], globalns, localns)
+        return annotation if resolved is args[0] else typing.Annotated[(resolved, *args[1:])]
     resolved_args = tuple(_resolve_forward_references(arg, globalns, localns) for arg in args)
     if all(resolved is arg for resolved, arg in zip(resolved_args, args)):
         return annotation
@@ -700,15 +743,107 @@ def _dataclass_field_types(cls: type) -> dict[str, Any]:
     globalns = getattr(module, "__dict__", {})
     localns = {cls.__name__: cls} if hasattr(cls, "__name__") else {}
 
-    field_types = {}
-    for field in fields(cls):
-        field_type = field.type
-        if isinstance(field_type, str) or _has_forward_reference(field_type):
-            field_type = resolved_types.get(field.name, field_type)
-        if _has_forward_reference(field_type):
-            field_type = _resolve_forward_references(field_type, globalns, localns)
-        field_types[field.name] = field_type
-    return field_types
+    return {
+        field.name: _resolve_field_annotation(field.type, field.name, resolved_types, globalns, localns)
+        for field in fields(cls)
+    }
+
+
+def _resolve_field_annotation(
+    annotation: Any, name: str, resolved_types: dict[str, Any], globalns: dict[str, Any], localns: dict[str, Any]
+) -> Any:
+    """`annotation` of the field `name`, with the strings and forward references in it evaluated."""
+    if isinstance(annotation, str) or _has_forward_reference(annotation):
+        annotation = resolved_types.get(name, annotation)
+    if _has_forward_reference(annotation):
+        annotation = _resolve_forward_references(annotation, globalns, localns)
+    return annotation
+
+
+@lru_cache(maxsize=None)
+def _named_tuple_field_types(cls: type) -> tuple[Any, ...]:
+    """The annotation of each field of the NamedTuple class `cls`, in field order.
+
+    A field without one (`collections.namedtuple`) is Any.
+    """
+    resolved_types = _resolved_field_types(cls)
+    # what `typing.get_type_hints` could not evaluate stays as written, to fail when that field is deserialized
+    declared: dict[str, Any] = {}
+    for base in reversed(cls.__mro__):
+        base_annotations = getattr(base, "__annotations__", None)
+        if isinstance(base_annotations, dict):
+            declared.update(base_annotations)
+    module = sys.modules.get(getattr(cls, "__module__", None))
+    globalns = getattr(module, "__dict__", {})
+    localns = {cls.__name__: cls}
+    return tuple(
+        _resolve_field_annotation(declared.get(name, Any), name, resolved_types, globalns, localns)
+        for name in cls._fields
+    )
+
+
+def _is_named_tuple(cls: Any) -> bool:
+    """Whether `cls` is a `typing.NamedTuple` or `collections.namedtuple` class (or a subclass of one)."""
+    return (
+        cls is not tuple
+        and isinstance(cls, type)
+        and typing.get_origin(cls) is None  # before Python 3.11 `isinstance(tuple[int], type)` is true
+        and issubclass(cls, tuple)
+        and isinstance(getattr(cls, "_fields", None), tuple)
+    )
+
+
+def _replace_type_variables(annotation: Any, replacements: Mapping[Any, Any]) -> Any:
+    """Return `annotation` with its type variables replaced, e.g. `list[T]` as `list[int]` for `{T: int}`.
+
+    A type variable that has no replacement stays as it is. Only parameterized aliases (`Box[T]`, `list[T]`,
+    `Optional[T]`, `T | None`, `Annotated[T, ...]`) are rebuilt; a generic class used without arguments is not.
+    """
+    if isinstance(annotation, TypeVar):
+        return replacements.get(annotation, annotation)
+
+    parameters = getattr(annotation, "__parameters__", None)
+    if not parameters or typing.get_origin(annotation) is None:
+        return annotation
+    try:
+        return annotation[tuple(replacements.get(parameter, parameter) for parameter in parameters)]
+    except Exception:
+        return annotation
+
+
+def _replaced_field_types(dataclass_cls: type, type_arguments: tuple[Any, ...]) -> dict[str, Any]:
+    field_types = _dataclass_field_types(dataclass_cls)
+    parameters = getattr(dataclass_cls, "__parameters__", ())
+    if not parameters or len(parameters) != len(type_arguments) or not all(map(_is_type_variable, parameters)):
+        # not a plain generic class (or an alias that does not match it, e.g. with a variadic parameter)
+        return field_types
+    replacements = dict(zip(parameters, type_arguments))
+    return {name: _replace_type_variables(annotation, replacements) for name, annotation in field_types.items()}
+
+
+def _is_type_variable(parameter: Any) -> bool:
+    return isinstance(parameter, TypeVar)
+
+
+_cached_replaced_field_types = lru_cache(maxsize=None)(_replaced_field_types)
+
+
+def _parameterized_field_types(cls: Any) -> dict[str, Any]:
+    """The annotation of each field of the dataclass `cls`: a dataclass, or an alias of a generic one (`Box[int]`).
+
+    For the alias, the type arguments take the place of the type variables in the annotations.
+    """
+    dataclass_cls = typing.get_origin(cls)
+    if dataclass_cls is None:
+        return _dataclass_field_types(cls)
+
+    type_arguments = typing.get_args(cls)
+    try:
+        hash(type_arguments)
+    except TypeError:
+        # e.g. the metadata of an Annotated argument is a list: not cacheable
+        return _replaced_field_types(dataclass_cls, type_arguments)
+    return _cached_replaced_field_types(dataclass_cls, type_arguments)
 
 
 # Handler for dataclasses with recursive deserialization
@@ -731,9 +866,16 @@ class DataclassJsonSerializingHandler(JsonSerializingHandler[DC]):
             raise TypeError(f"Expected a JSON object for {cls}, got {type(data).__name__}")
         kwargs = {}
         not_init = {}
-        field_types = _dataclass_field_types(cls)
+        # `cls` is also an alias of a generic dataclass such as `Box[int]`: the fields and the constructor are those of
+        # the class itself
+        if type(cls) is type:
+            dataclass_cls = cls
+            field_types = _dataclass_field_types(cls)
+        else:
+            dataclass_cls = typing.get_origin(cls) or cls
+            field_types = _parameterized_field_types(cls)
         # Iterate through each field of the dataclass
-        for field in fields(cls):
+        for field in fields(dataclass_cls):
             field_name = field.name
             field_type = field_types[field_name]
             try:
@@ -754,7 +896,7 @@ class DataclassJsonSerializingHandler(JsonSerializingHandler[DC]):
             else:
                 not_init[field_name] = deserialized_value
 
-        instance = cls(**kwargs)
+        instance = dataclass_cls(**kwargs)
         for field_name, deserialized_value in not_init.items():
             # `__init__` does not take these; set them like the constructor does (also for frozen and slots classes)
             object.__setattr__(instance, field_name, deserialized_value)
@@ -1169,9 +1311,8 @@ def _run_deserialize_steps_stack(stack: list[_DeserializeSteps]) -> Any:
 
 def _enter_deserialization(data: JSON, cls: Any, stack: list[_DeserializeSteps]) -> Any:
     """Return `data` deserialized as `cls`, or `_PENDING` after pushing the steps of a container onto `stack`."""
-    if cls is None:
-        # PEP 484: None in an annotation stands for NoneType
-        cls = type(None)
+    if not isinstance(cls, type):
+        cls = _normalize_annotation(cls)
 
     if cls is Any:
         return _copy_json(data)
@@ -1185,6 +1326,10 @@ def _enter_deserialization(data: JSON, cls: Any, stack: list[_DeserializeSteps])
             raise TypeError(f"Expected null, got {type(data).__name__}")
         return None
 
+    if cls is str or cls is int or cls is bool or cls is float:
+        # no handler to look for
+        return _enter_without_handler(data, cls)
+
     handler = _get_handler(cls)
     if handler is UnionJsonSerializingHandler:
         return _enter_union_deserialization(data, get_args(cls), stack)
@@ -1194,27 +1339,39 @@ def _enter_deserialization(data: JSON, cls: Any, stack: list[_DeserializeSteps])
             return handler.deserialize(data, cls)
         return _push_deserialize_steps(deserialize_steps(data, cls), stack)
 
+    dict_cls = typing.get_origin(cls) or cls
+    if isinstance(dict_cls, type) and issubclass(dict_cls, dict) and data is not None:
+        # dict[K, V], a bare dict or typing.Dict, Counter, a dict subclass: a JSON object, like Mapping and unlike a
+        # scalar or an array, which unions need to refuse. (null stays: it is what a missing dataclass field is.)
+        if not isinstance(data, dict):
+            raise TypeError(f"Expected a JSON object for {cls}, got {type(data).__name__}")
+        generic_args = get_args(cls)
+        if len(generic_args) == 1 and issubclass(dict_cls, Counter):
+            # Counter[K]: the counts are ints
+            generic_args = (generic_args[0], int)
+        if generic_args:
+            key_cls, value_cls = generic_args
+            data = _deserialize_keys(data, key_cls)
+            return _push_deserialize_steps(_dict_value_steps(data, value_cls), stack)
+        # a bare dict or typing.Dict is passed through as is: copied below
+
+    return _enter_without_handler(data, cls)
+
+
+def _enter_without_handler(data: JSON, cls: Any) -> Any:
+    """Return `data` as `cls`, an annotation with no handler (and no dict): scalars pass through unchecked, objects
+    unless the annotation is a text or a number, arrays never do."""
     if isinstance(data, dict):
-        if is_generic_type(cls):
-            origin_type = get_origin(cls)
-            if issubclass(origin_type, dict):
-                generic_args = get_args(cls)
-                if len(generic_args) == 1 and issubclass(origin_type, Counter):
-                    # Counter[K]: the counts are ints
-                    generic_args = (generic_args[0], int)
-                if generic_args:
-                    key_cls, value_cls = generic_args
-                    data = _deserialize_keys(data, key_cls)
-                    return _push_deserialize_steps(_dict_value_steps(data, value_cls), stack)
-                # a bare typing.Dict (like an unparameterized dict) falls through to the copy below
+        if isinstance(cls, TypeVar):
+            # a type parameter that no type argument replaced (e.g. the T of a plain `Box`): only a scalar passes
+            raise TypeError(f"Unsupported type for deserialization: {cls}")
+        if isinstance(cls, type) and issubclass(cls, (str, int, float)):
+            # a JSON object is no text or number (bool is an int): raise TypeError so that a union moves on to a
+            # member that takes objects, such as a dataclass. A scalar of the wrong kind is not checked (see below).
+            raise TypeError(f"Expected a JSON scalar for {cls}, got {type(data).__name__}")
 
-        elif issubclass(cls, Jsonable):
-            return JsonableSerializingHandler.deserialize(data, cls)
-
-        elif is_dataclass(cls):
-            return _push_deserialize_steps(DataclassJsonSerializingHandler.deserialize_steps(data, cls), stack)
-
-        # passed through as is (e.g. an unparameterized `dict`): copy, so that the result does not alias the input
+        # passed through as is (Any, object, a class without handler, ...): copy, so that the result does not alias the
+        # input
         return _copy_json(data)
 
     if is_json_primitive(data):

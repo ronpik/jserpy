@@ -299,6 +299,15 @@ class Box(Generic[T]):
     items: list[T]
 
 
+K = TypeVar("K")
+V = TypeVar("V")
+
+
+@dataclass(frozen=True)
+class Outer(Generic[T]):
+    box: Box[T]
+
+
 @dataclass(frozen=True)
 class HoldsBox:
     box: Box[Point]
@@ -988,23 +997,62 @@ def test_str_value_that_looks_like_the_first_member_is_converted_limitation(
     assert_strictly_equal(round_trip_as(value, annotation), claimed_by_first_member)
 
 
-# A primitive annotation (str, int, ...) hands a JSON object through unvalidated, so a primitive member in front of a
-# dataclass or a typed dict claims every object: "id or embedded object" unions only work with the object first.
+# A primitive annotation (str, int, ...) refuses a JSON object, so a primitive member in front of a dataclass or a dict
+# does not claim the objects: "id or embedded object" unions work with either order.
 @pytest.mark.parametrize(
-    ("annotation", "data"),
+    ("annotation", "data", "expected"),
     [
-        pytest.param(Union[str, Point], {"x": 1, "y": 2}, id="str|dataclass"),
-        pytest.param(Union[int, Point], {"x": 1, "y": 2}, id="int|dataclass"),
-        pytest.param(Union[float, Point], {"x": 1, "y": 2}, id="float|dataclass"),
-        pytest.param(Union[str, dict[str, tuple[int, int]]], {"a": [1, 2]}, id="str|dict-of-tuples"),
+        pytest.param(Union[str, Point], {"x": 1, "y": 2}, Point(1, 2), id="str|dataclass"),
+        pytest.param(Union[int, Point], {"x": 1, "y": 2}, Point(1, 2), id="int|dataclass"),
+        pytest.param(Union[float, Point], {"x": 1, "y": 2}, Point(1, 2), id="float|dataclass"),
+        pytest.param(Union[bool, Point], {"x": 1, "y": 2}, Point(1, 2), id="bool|dataclass"),
+        pytest.param(Optional[Point], {"x": 1, "y": 2}, Point(1, 2), id="optional-dataclass"),
+        pytest.param(Union[str, dict[str, tuple[int, int]]], {"a": [1, 2]}, {"a": (1, 2)}, id="str|dict-of-tuples"),
     ],
 )
-def test_primitive_member_before_an_object_member_claims_the_object_limitation(annotation, data):
-    # Documents current behavior, not a promise: the raw JSON object comes back (as an independent copy), unconverted.
+def test_primitive_member_before_an_object_member_does_not_claim_the_object(annotation, data, expected):
     restored = deserialize_json(data, annotation)
 
-    assert_strictly_equal(restored, data)
+    assert_strictly_equal(restored, expected)
     assert_no_shared_containers(restored, data)
+
+
+@pytest.mark.parametrize("annotation", [str, int, float, bool, Optional[str], Union[int, float]])
+def test_primitive_annotation_refuses_a_json_object(annotation):
+    with pytest.raises(TypeError, match="got dict") as caught:
+        deserialize_json({"LEAK": "LEAK"}, annotation)
+
+    assert "LEAK" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [bytes, Decimal, datetime.date, datetime.datetime, Path, Color, Level],
+    ids=lambda annotation: annotation.__name__,
+)
+def test_annotations_with_a_handler_refuse_a_json_object(annotation):
+    with pytest.raises(TypeError) as caught:
+        deserialize_json({"LEAK": "LEAK"}, annotation)
+
+    assert "LEAK" not in str(caught.value)
+
+
+def test_object_and_any_annotations_still_hand_an_object_through_as_an_independent_copy():
+    data = {"a": [1, {"b": 2}]}
+
+    for annotation in (Any, object, dict):
+        restored = deserialize_json(data, annotation)
+
+        assert restored == data
+        assert_no_shared_containers(restored, data)
+
+
+def test_primitive_annotation_still_takes_a_scalar_of_another_kind_limitation():
+    # Documents current behavior, not a promise: only a JSON object is refused for a primitive annotation. A scalar is
+    # handed through unvalidated, which is also why a primitive member in front of an Enum claims its text.
+    assert deserialize_json("x", int) == "x"
+    assert deserialize_json(5, str) == 5
+    assert deserialize_json("red", Union[int, Color]) == "red"
 
 
 @pytest.mark.parametrize(
@@ -1020,24 +1068,14 @@ def test_object_member_before_a_primitive_member_gives_id_or_object_unions(annot
     assert_strictly_equal(deserialize_json(data, annotation), expected)
 
 
-# A parameterized dict, unlike list/tuple/set/Mapping, takes a JSON scalar as is instead of raising TypeError, so it
-# also claims the scalars that a later union member should get.
-@pytest.mark.xfail(
-    strict=True,
-    raises=pytest.fail.Exception,
-    reason="dict[K, V] returns a JSON scalar unchanged instead of raising TypeError (Mapping[K, V] raises)",
-)
+# A dict annotation, like list/tuple/set/Mapping, raises TypeError for a JSON scalar, so that it does not claim the
+# scalars that a later union member should get.
 @pytest.mark.parametrize("data", ["abc", 5, 1.5, True], ids=["str", "int", "float", "bool"])
 def test_parameterized_dict_annotation_rejects_a_scalar(data):
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match=r"Expected a JSON object for .*, got " + type(data).__name__):
         deserialize_json(data, dict[str, int])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="dict[K, V] returns a JSON scalar unchanged instead of raising TypeError, so it claims the str",
-)
 def test_parameterized_dict_member_does_not_claim_a_string_wanted_by_a_later_member():
     assert deserialize_json("red", Union[dict[str, int], Color]) is Color.RED
 
@@ -2061,14 +2099,12 @@ def test_type_annotations_are_not_interpreted_limitation(annotation):
         deserialize_json([1], annotation)
 
 
-def test_named_tuple_comes_back_as_a_plain_tuple_limitation():
-    # Documents current behavior, not a promise: a NamedTuple is a tuple subclass, so it serializes as a plain array,
-    # and the target is handled like a bare `tuple`: the result is no NamedPair and its items are not converted.
+def test_named_tuple_serializes_as_a_plain_array_and_comes_back_as_the_named_tuple():
     value = NamedPair(DAY, 3)
 
     assert serialize_json(value) == '["2026-10-27", 3]'
-    assert_strictly_equal(deserialize_json(to_json_value(value), NamedPair), ("2026-10-27", 3))
-    assert_strictly_equal(deserialize_json([["2026-10-27", 3]], list[NamedPair]), [("2026-10-27", 3)])
+    assert_strictly_equal(deserialize_json(to_json_value(value), NamedPair), value)
+    assert_strictly_equal(deserialize_json([["2026-10-27", 3]], list[NamedPair]), [value])
 
 
 def test_typed_dict_values_are_handed_through_unconverted_limitation():
@@ -2082,17 +2118,12 @@ def test_typed_dict_values_are_handed_through_unconverted_limitation():
 
 # --- NewType, Annotated, Final, ClassVar, TypeVar, Generic ------------------------------------------------------------
 
-_NEW_TYPE_REASON = "NewType is not unwrapped to its supertype (TypeError: issubclass() arg 1 must be a class)"
-_NEW_TYPE_XFAIL = pytest.mark.xfail(strict=True, raises=TypeError, reason=_NEW_TYPE_REASON)
-
-
 def test_new_type_values_serialize_as_their_supertype():
     account = Account(UserId(7), Slug("ann"), [UserId(1), UserId(2)], None)
 
     assert serialize_json(account) == '{"uid": 7, "slug": "ann", "friends": [1, 2], "boss": null}'
 
 
-@_NEW_TYPE_XFAIL
 @pytest.mark.parametrize(
     ("annotation", "data", "expected"),
     [
@@ -2107,7 +2138,6 @@ def test_new_type_target_behaves_like_its_supertype(annotation, data, expected):
     assert_strictly_equal(deserialize_json(data, annotation), expected)
 
 
-@_NEW_TYPE_XFAIL
 def test_new_type_dataclass_fields_round_trip():
     account = Account(UserId(7), Slug("ann"), [UserId(1), UserId(2)], UserId(3))
 
@@ -2137,17 +2167,6 @@ def test_annotated_optional_field_accepts_null():
     assert_round_trip(value, Measured)
 
 
-# Python 3.14 raises TypeError (issubclass() arg 1 must be a class); on 3.10, where Annotated is a plain class, the JSON
-# value is passed through unconverted, which the strict comparison reports. Only cases that fail on both are listed:
-# Annotated[int, ...] "works" on 3.10 because primitives are never validated.
-_ANNOTATED_XFAIL = pytest.mark.xfail(
-    strict=True,
-    raises=(TypeError, AssertionError),
-    reason="Annotated[X, ...] is not unwrapped to X outside string annotations",
-)
-
-
-@_ANNOTATED_XFAIL
 @pytest.mark.parametrize(
     ("annotation", "data", "expected"),
     [
@@ -2166,7 +2185,6 @@ def test_annotated_field_with_a_real_annotation_serializes_as_its_wrapped_type()
     assert serialize_json(RealMeasured(count=1, when=DAY)) == '{"count": 1, "when": "2026-10-27"}'
 
 
-@_ANNOTATED_XFAIL
 def test_annotated_field_with_a_real_annotation_round_trips():
     assert_round_trip(RealMeasured(count=1, when=DAY), RealMeasured)
 
@@ -2185,13 +2203,81 @@ def test_final_field_serializes_as_its_value():
     assert serialize_json(WithFinal("x")) == '{"name": "x", "limit": 10}'
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=TypeError,
-    reason="Final[X] is not unwrapped to X (TypeError: issubclass() arg 1 must be a class)",
-)
 def test_final_field_round_trips():
     assert_round_trip(WithFinal("x", 12), WithFinal)
+
+
+AdminId = NewType("AdminId", UserId)
+Day = NewType("Day", datetime.date)
+ColorOf = NewType("ColorOf", Color)
+Spot = NewType("Spot", Point)
+KeyName = NewType("KeyName", str)
+
+
+@pytest.mark.parametrize(
+    ("annotation", "data", "expected"),
+    [
+        pytest.param(AdminId, 7, 7, id="new-type-of-new-type"),
+        pytest.param(Day, "2026-10-27", DAY, id="new-type-of-date"),
+        pytest.param(ColorOf, "red", Color.RED, id="new-type-of-enum"),
+        pytest.param(Spot, {"x": 1, "y": 2}, Point(1, 2), id="new-type-of-dataclass"),
+        pytest.param(Optional[Spot], {"x": 1, "y": 2}, Point(1, 2), id="optional-new-type-of-dataclass"),
+        pytest.param(Union[Spot, int], 5, 5, id="union-with-new-type-member"),
+        pytest.param(Final[UserId], 7, 7, id="final-new-type"),
+        pytest.param(Final[list[int]], [1, 2], [1, 2], id="final-list"),
+        pytest.param(Final[Annotated[Color, "m"]], "red", Color.RED, id="final-annotated"),
+        pytest.param(Annotated[Annotated[Color, "a"], "b"], "red", Color.RED, id="annotated-twice"),
+        pytest.param(Annotated[Final[Color], "m"], "red", Color.RED, id="annotated-final"),
+        pytest.param(Annotated[Union[Color, int], "m"], "red", Color.RED, id="annotated-union"),
+        pytest.param(Annotated[Optional[Point], "m"], None, None, id="annotated-optional-null"),
+        pytest.param(Annotated[Spot, "m"], {"x": 1, "y": 2}, Point(1, 2), id="annotated-new-type"),
+        pytest.param(dict[str, Annotated[Point, "m"]], {"a": {"x": 1, "y": 2}}, {"a": Point(1, 2)}, id="dict-value"),
+        pytest.param(tuple[UserId, Annotated[Color, "m"]], [1, "red"], (1, Color.RED), id="tuple-items"),
+        pytest.param(set[Annotated[Color, "m"]], ["red"], {Color.RED}, id="set-items"),
+        pytest.param(Final, {"a": [1]}, {"a": [1]}, id="bare-final-is-any"),
+    ],
+)
+def test_wrappers_are_removed_at_any_depth_of_an_annotation(annotation, data, expected):
+    assert_strictly_equal(deserialize_json(data, annotation), expected)
+
+
+@pytest.mark.parametrize(
+    ("annotation", "data", "expected"),
+    [
+        pytest.param(dict[KeyName, int], {"a": 1}, {"a": 1}, id="new-type-of-str"),
+        pytest.param(dict[ColorOf, int], {"red": 1}, {Color.RED: 1}, id="new-type-of-enum"),
+        pytest.param(dict[Annotated[Color, "m"], int], {"red": 1}, {Color.RED: 1}, id="annotated-enum"),
+        pytest.param(dict[Annotated[str, "m"], int], {"a": 1}, {"a": 1}, id="annotated-str"),
+        pytest.param(
+            dict[Annotated[tuple[int, str], "m"], int], {'[1, "a"]': 1}, {(1, "a"): 1}, id="annotated-tuple"
+        ),
+        pytest.param(Mapping[Annotated[Color, "m"], int], {"red": 1}, {Color.RED: 1}, id="mapping-annotated-enum"),
+        pytest.param(dict[Final[KeyName], int], {"a": 1}, {"a": 1}, id="final-new-type"),
+    ],
+)
+def test_mapping_key_annotations_are_unwrapped(annotation, data, expected):
+    assert_strictly_equal(deserialize_json(data, annotation), expected)
+
+
+@pytest.mark.parametrize(
+    ("annotation", "data"),
+    [
+        pytest.param(Annotated[list[int], "m"], {"k": SENTINEL}, id="annotated-list-given-an-object"),
+        pytest.param(Annotated[Point, "m"], [SENTINEL], id="annotated-dataclass-given-an-array"),
+        pytest.param(Spot, [SENTINEL], id="new-type-dataclass-given-an-array"),
+        pytest.param(ColorOf, SENTINEL, id="new-type-enum-given-another-text"),
+        pytest.param(Final[dict[str, int]], SENTINEL, id="final-dict-given-a-scalar"),
+        pytest.param(AdminId, {"k": SENTINEL}, id="new-type-int-given-an-object"),
+        pytest.param(Optional[Spot], [SENTINEL], id="optional-new-type-given-an-array"),
+        pytest.param(dict[Annotated[Color, "m"], int], {SENTINEL: 1}, id="annotated-key-not-a-member"),
+    ],
+)
+def test_unwrapped_annotations_keep_their_checks_and_name_no_data(annotation, data):
+    with pytest.raises(TypeError) as caught:
+        deserialize_json(data, annotation)
+
+    assert SENTINEL not in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 @pytest.mark.parametrize(
@@ -2230,11 +2316,6 @@ def test_type_variable_fields_refuse_structured_json_limitation(data):
         deserialize_json(data, Box)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=TypeError,
-    reason="a parameterized generic dataclass (Box[int]) is rejected: dataclasses.fields() does not take the alias",
-)
 @pytest.mark.parametrize(
     ("annotation", "data", "expected"),
     [
@@ -2252,19 +2333,115 @@ def test_parameterized_generic_dataclass_can_be_deserialized(annotation, data, e
 
 
 @pytest.mark.parametrize(
-    ("annotation", "data"),
+    ("annotation", "data", "expected"),
     [
-        pytest.param(Box[Point], {"item": {"x": 1, "y": 2}, "items": [{"x": 3, "y": 4}]}, id="Box[Point]"),
-        pytest.param(Optional[Box[Color]], {"item": "red", "items": ["blue"]}, id="Optional[Box[Color]]"),
-        pytest.param(HoldsBox, {"box": {"item": {"x": 1, "y": 2}, "items": []}}, id="field-Box[Point]"),
+        pytest.param(
+            Box[Point],
+            {"item": {"x": 1, "y": 2}, "items": [{"x": 3, "y": 4}]},
+            Box(Point(1, 2), [Point(3, 4)]),
+            id="Box[Point]",
+        ),
+        pytest.param(
+            Optional[Box[Color]],
+            {"item": "red", "items": ["blue"]},
+            Box(Color.RED, [Color.BLUE]),
+            id="Optional[Box[Color]]",
+        ),
+        pytest.param(
+            HoldsBox,
+            {"box": {"item": {"x": 1, "y": 2}, "items": []}},
+            HoldsBox(Box(Point(1, 2), [])),
+            id="field-Box[Point]",
+        ),
+        pytest.param(
+            Box[datetime.date], {"item": "2026-10-27", "items": ["2026-10-28"]}, Box(DAY, [DAY_AFTER]), id="Box[date]"
+        ),
+        pytest.param(
+            Box[Optional[int]], {"item": None, "items": [None, 1]}, Box(None, [None, 1]), id="Box[Optional[int]]"
+        ),
+        pytest.param(Box[int | None], {"item": 5, "items": []}, Box(5, []), id="Box[int | None]"),
+        pytest.param(
+            Box[Box[Point]],
+            {"item": {"item": {"x": 1, "y": 2}, "items": []}, "items": [{"item": {"x": 3, "y": 4}, "items": []}]},
+            Box(Box(Point(1, 2), []), [Box(Point(3, 4), [])]),
+            id="Box[Box[Point]]",
+        ),
+        pytest.param(
+            Box[list[Point]],
+            {"item": [{"x": 1, "y": 2}], "items": [[]]},
+            Box([Point(1, 2)], [[]]),
+            id="Box[list[Point]]",
+        ),
+        pytest.param(
+            Box[Annotated[Color, "m"]], {"item": "red", "items": []}, Box(Color.RED, []), id="Box[Annotated[Color]]"
+        ),
+        pytest.param(Box[UserId], {"item": 7, "items": [8]}, Box(7, [8]), id="Box[NewType]"),
+        pytest.param(Box[Any], {"item": {"a": [1]}, "items": [{"b": 2}]}, Box({"a": [1]}, [{"b": 2}]), id="Box[Any]"),
+        pytest.param(Box[Annotated[int, []]], {"item": 1, "items": [2]}, Box(1, [2]), id="Box[unhashable-annotated]"),
+        pytest.param(
+            dict[str, Box[Point]],
+            {"k": {"item": {"x": 1, "y": 2}, "items": []}},
+            {"k": Box(Point(1, 2), [])},
+            id="dict[str, Box[Point]]",
+        ),
+        pytest.param(
+            Union[int, Box[Point]],
+            {"item": {"x": 1, "y": 2}, "items": []},
+            Box(Point(1, 2), []),
+            id="Union[int, Box[Point]]",
+        ),
     ],
 )
-def test_type_arguments_of_a_generic_dataclass_are_not_substituted_limitation(annotation, data):
-    # Documents current behavior, not a promise: nothing maps the T of Box[Point] onto the TypeVar fields, so a
-    # Box[Point] cannot be restored (today it is refused already because the parameterized alias is rejected, see the
-    # xfail above). It is refused loudly, never half-restored with raw dicts in place of Points.
-    with pytest.raises(TypeError):
+def test_type_arguments_of_a_generic_dataclass_replace_its_type_variables(annotation, data, expected):
+    assert_strictly_equal(deserialize_json(data, annotation), expected)
+
+
+@pytest.mark.parametrize(
+    ("annotation", "data"),
+    [
+        pytest.param(Box[int], {"item": {"a": SENTINEL}, "items": []}, id="object-for-int"),
+        pytest.param(Box[Point], {"item": SENTINEL, "items": []}, id="scalar-for-dataclass"),
+        pytest.param(Box[Point], {"item": {"x": 1, "y": 2}, "items": [SENTINEL]}, id="scalar-for-dataclass-in-list"),
+        pytest.param(Box[Color], {"item": SENTINEL, "items": []}, id="unknown-enum-value"),
+        pytest.param(Box[Point], [SENTINEL], id="array-for-the-box"),
+        pytest.param(Box[Box[Point]], {"item": {"item": [SENTINEL], "items": []}, "items": []}, id="nested-box"),
+    ],
+)
+def test_substituted_type_arguments_are_checked_and_name_no_data(annotation, data):
+    with pytest.raises(TypeError) as caught:
         deserialize_json(data, annotation)
+
+    assert SENTINEL not in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+@dataclass(frozen=True)
+class Pair(Generic[K, V]):
+    first: K
+    second: dict[str, V]
+    maybe: Optional[V] = None
+    tagged: Annotated[list[K], "keys"] = dataclasses.field(default_factory=list)
+
+
+def test_generic_dataclass_with_several_type_variables_maps_each_argument():
+    value = Pair(DAY, {"a": Point(1, 2)}, Point(3, 4), [DAY_AFTER])
+
+    assert_round_trip(value, Pair[datetime.date, Point])
+    assert_strictly_equal(
+        deserialize_json({"first": "red", "second": {"a": 5}, "maybe": None, "tagged": ["blue"]}, Pair[Color, int]),
+        Pair(Color.RED, {"a": 5}, None, [Color.BLUE]),
+    )
+
+
+def test_generic_dataclass_in_a_generic_dataclass_takes_the_outer_type_argument():
+    value = Outer(Box(DAY, [DAY_AFTER]))
+
+    assert_round_trip(value, Outer[datetime.date])
+
+
+def test_a_type_variable_without_argument_keeps_the_raw_scalar_limitation():
+    # Documents current behavior, not a promise: without a type argument the field is not converted.
+    assert_strictly_equal(deserialize_json({"item": "2026-10-27", "items": []}, Box), Box("2026-10-27", []))
 
 
 # --- forward references and string annotations ------------------------------------------------------------------------

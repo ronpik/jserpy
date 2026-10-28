@@ -410,6 +410,9 @@ ORDER_CORRUPTIONS = [
     pytest.param(("shipping_events", "PARCEL-1"), "in transit", id="string-where-event-list-expected"),
     pytest.param(("shipping_events", "PARCEL-2"), {"at": "2026-03-02T08:00:00"}, id="object-where-event-list-expected"),
     pytest.param(("shipping_events",), [["PARCEL-2", []]], id="array-of-pairs-where-event-table-expected"),
+    pytest.param(("shipping_events",), "in transit", id="string-where-event-table-expected"),
+    pytest.param(("shipping_events",), 7, id="number-where-event-table-expected"),
+    pytest.param(("shipping_events",), True, id="bool-where-event-table-expected"),
     pytest.param(("invoice_pdf",), "abc", id="base64-with-bad-padding"),
     pytest.param(("tags",), {"gift": True}, id="object-where-tag-set-expected"),
     pytest.param(("tags",), "gift", id="string-where-tag-set-expected"),
@@ -423,21 +426,6 @@ ORDER_CORRUPTIONS = [
 @pytest.mark.parametrize(("path", "replacement"), ORDER_CORRUPTIONS)
 def test_corrupted_order_is_rejected(path, replacement):
     assert_rejected(FULL_ORDER_JSON, Order, path, replacement)
-
-
-@pytest.mark.parametrize(
-    "bad",
-    [pytest.param("in transit", id="string"), pytest.param(7, id="number"), pytest.param(True, id="bool")],
-)
-def test_primitive_where_a_dict_field_is_expected_is_passed_through_limitation(bad):
-    # Documents current behavior, not a promise: a dict[...] annotation has no handler of its own and JSON primitives
-    # are returned unchecked for such annotations, so the field holds the primitive. Mapping[...], list, tuple and set
-    # annotations raise TypeError for the same input (see the corruptions of the config and of this order).
-    broken = corrupted(FULL_ORDER_JSON, ("shipping_events",), bad)
-
-    restored = deserialize_json(broken, Order)
-
-    assert type(restored.shipping_events) is type(bad) and restored.shipping_events == bad
 
 
 def test_order_whose_metadata_contains_itself_is_rejected():

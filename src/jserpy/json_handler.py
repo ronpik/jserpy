@@ -1,6 +1,7 @@
 import base64
 import datetime
 import json
+import sys
 import typing
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Mapping
@@ -270,12 +271,13 @@ def _restore_tuple_key(key: str, cls: Union[Type[Tuple], GenericAlias]) -> tuple
 
 
 def _reconstruct_key(key: str, cls: Type[T]) -> T:
-    if issubclass(cls, Enum):
-        return EnumJsonSerializingHandler.deserialize(key, cls)
-
+    # issubclass() takes the origin: it rejects a parameterized `typing.Tuple[...]` (and, from Python 3.13, `tuple[...]`)
     cls_origin = cast(type, get_origin(cls))
     if cls_origin is None:
         cls_origin = cls
+
+    if issubclass(cls_origin, Enum):
+        return EnumJsonSerializingHandler.deserialize(key, cls)
 
     if issubclass(cls_origin, tuple):
         return _restore_tuple_key(key, cls)
@@ -579,6 +581,74 @@ def _resolved_field_types(cls: type) -> dict[str, Any]:
         return {}
 
 
+def _has_forward_reference(annotation: Any) -> bool:
+    """Whether `annotation` holds a string or `ForwardRef`, e.g. `Optional["Node"]` or `list["Node"]`.
+
+    The type arguments of `Literal` (values) and `Annotated` (metadata) are not annotations; they are skipped.
+    Iterative, since annotations can nest as deeply as the data.
+    """
+    pending = [annotation]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, (str, typing.ForwardRef)):
+            return True
+        if typing.get_origin(item) in (typing.Literal, typing.Annotated):
+            continue
+        pending.extend(typing.get_args(item))
+    return False
+
+
+def _resolve_forward_references(annotation: Any, globalns: dict[str, Any], localns: dict[str, Any]) -> Any:
+    """Evaluate the string and `ForwardRef` arguments inside `annotation`.
+
+    `typing.get_type_hints` leaves the strings in builtin generics such as `list["Node"]` before Python 3.11. A
+    reference that cannot be evaluated is left as it is, which fails when the field is deserialized.
+    """
+    if isinstance(annotation, (str, typing.ForwardRef)):
+        expression = annotation if isinstance(annotation, str) else annotation.__forward_arg__
+        try:
+            evaluated = eval(expression, globalns, localns)
+        except Exception:
+            return annotation
+        if isinstance(evaluated, (str, typing.ForwardRef)):
+            return annotation
+        return _resolve_forward_references(evaluated, globalns, localns)
+
+    args = typing.get_args(annotation)
+    if not args or typing.get_origin(annotation) in (typing.Literal, typing.Annotated):
+        return annotation
+    resolved_args = tuple(_resolve_forward_references(arg, globalns, localns) for arg in args)
+    if all(resolved is arg for resolved, arg in zip(resolved_args, args)):
+        return annotation
+    try:
+        if isinstance(annotation, GenericAlias):
+            return GenericAlias(typing.get_origin(annotation), resolved_args)
+        if typing.get_origin(annotation) is Union or isinstance(annotation, UnionType):
+            return Union[resolved_args]
+        return annotation.copy_with(resolved_args)
+    except Exception:
+        return annotation
+
+
+@lru_cache(maxsize=None)
+def _dataclass_field_types(cls: type) -> dict[str, Any]:
+    """The annotation of each field of the dataclass `cls`, with the references to classes by name resolved once."""
+    resolved_types = _resolved_field_types(cls)
+    module = sys.modules.get(getattr(cls, "__module__", None))
+    globalns = getattr(module, "__dict__", {})
+    localns = {cls.__name__: cls} if hasattr(cls, "__name__") else {}
+
+    field_types = {}
+    for field in fields(cls):
+        field_type = field.type
+        if isinstance(field_type, str) or _has_forward_reference(field_type):
+            field_type = resolved_types.get(field.name, field_type)
+        if _has_forward_reference(field_type):
+            field_type = _resolve_forward_references(field_type, globalns, localns)
+        field_types[field.name] = field_type
+    return field_types
+
+
 # Handler for dataclasses with recursive deserialization
 class DataclassJsonSerializingHandler(JsonSerializingHandler[DC]):
 
@@ -595,16 +665,18 @@ class DataclassJsonSerializingHandler(JsonSerializingHandler[DC]):
     @staticmethod
     def deserialize_steps(data: JSON, cls: type[DC]) -> _DeserializeSteps:
         kwargs = {}
-        resolved_types = _resolved_field_types(cls)
+        not_init = {}
+        field_types = _dataclass_field_types(cls)
         # Iterate through each field of the dataclass
         for field in fields(cls):
             field_name = field.name
-            field_type = field.type
-            if isinstance(field_type, str):
-                field_type = resolved_types.get(field_name, field_type)
+            field_type = field_types[field_name]
             try:
                 field_value = data[field_name]
             except KeyError as e:
+                if not field.init:
+                    # e.g. computed in `__post_init__`: keeps what the constructor made of it
+                    continue
                 if not is_optional_type(field_type):
                     pass
                     # LOG.warning(f"Couldn't find a required field named {field_name} of dataclass {cls} "
@@ -612,9 +684,16 @@ class DataclassJsonSerializingHandler(JsonSerializingHandler[DC]):
                 field_value = None
 
             deserialized_value = yield field_value, field_type
-            kwargs[field_name] = deserialized_value
+            if field.init:
+                kwargs[field_name] = deserialized_value
+            else:
+                not_init[field_name] = deserialized_value
 
-        return cls(**kwargs)
+        instance = cls(**kwargs)
+        for field_name, deserialized_value in not_init.items():
+            # `__init__` does not take these; set them like the constructor does (also for frozen and slots classes)
+            object.__setattr__(instance, field_name, deserialized_value)
+        return instance
 
 
 # Handler for numpy arrays
